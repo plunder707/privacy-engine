@@ -1,0 +1,47 @@
+[package]
+name = "privacy-engine-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime (The Engine)
+tokio = { version = "1.36", features = ["full"] }
+
+# HTTP Library (Low-level, fast)
+hyper = { version = "1.2", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.5"
+
+# TLS & Encryption (Security)
+# Removed 'std' feature from tokio-rustls as it triggered a conflict
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.1"
+rcgen = "0.13" # For generating certs on the fly
+
+# Logging & Error Handling
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1.0"
+anyhow = "1.0"
+serde_json = "1.0"
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
+
+# DNS Pre-Filter
+hickory-proto = "0.25"
+
+# HTML Response Body Rewriting
+lol_html = "2.1"
+
+# Gzip/Deflate/Brotli decompression for body rewriting
+flate2 = "1.0"
+brotli = "7.0"
+
+# SHA-256 fingerprinting for cert transparency log (already transitive dep via rustls)
+ring = "0.17"
+base64 = "0.22"
+
+# CLI Argument Parsing
+clap = { version = "4.5", features = ["derive"] }

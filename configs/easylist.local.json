@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "Local dev: MITM + DNS + EasyList + dashboard",
+    "notes": "Example runtime config to avoid long CLI invocations. Paths under /tmp are safe for local testing."
+  },
+  "listen_host": "127.0.0.1",
+  "listen_port": 18081,
+  "pinned_hosts_file": "/tmp/pe_pinned_hosts.json",
+  "enable_mitm": true,
+  "mitm_ca_cert_file": "/tmp/pe_ca_cert.pem",
+  "mitm_ca_key_file": "/tmp/pe_ca_key.pem",
+  "mitm_ca_generate_if_missing": true,
+  "mitm_ca_export_cert_file": "/tmp/pe_ca_cert_export.pem",
+  "tls_profile": "chrome",
+  "policy_config_file": "docs/policy_full.json",
+  "policy_mode": "enforce",
+  "policy_reload_interval_secs": 5,
+  "enable_dns_filter": true,
+  "dns_listen_host": "127.0.0.1",
+  "dns_listen_port": 5353,
+  "dns_upstream": "1.1.1.1:53",
+  "filter_list_file": ["/tmp/easylist.txt"],
+  "filter_list_cache_dir": "filter_list_cache",
+  "filter_list_refresh_secs": 86400,
+  "filter_list_download_timeout_secs": 30,
+  "receipts_file": "/tmp/pe_receipts.json",
+  "receipts_flush_interval_secs": 5,
+  "metrics_log_interval_secs": 30,
+  "dashboard_port": 9090,
+  "cert_log_file": "/tmp/pe_cert_log.jsonl",
+  "cert_pin_file": "/tmp/pe_cert_pins.json"
+}
+

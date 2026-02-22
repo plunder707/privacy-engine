@@ -1,0 +1,30 @@
+/target
+
+# Auto-generated CA files (never commit the private key)
+mitm_ca_key.pem
+mitm_ca_cert.pem
+
+# Auto-generated runtime state
+sni_pinned_hosts.json
+filter_list_cache/
+
+# Logs
+engine.log
+*.jsonl
+
+# Internal working notes (not project docs)
+MEMORY.md
+BRAINSTORM.md
+CLAUDE_INTEL.md
+suggestfix.md
+
+# Internal sprint notes and research docs
+docs/COMPETITORS.md
+docs/RESEARCH.md
+docs/RECEIPTS_RESEARCH.md
+docs/RECEIPTS_RESEARCH_RESULTS.md
+docs/RECEIPTS_RESEARCH_RESULTS_V2.md
+docs/RECEIPTS_RESEARCH_RESULTS_V3.md
+docs/SPRINT_4C_NOTES.md
+docs/PHASE4_HANDOFF.md
+docs/NEXT_PHASE.md

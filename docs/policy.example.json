@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "mode": "report_only",
+  "meta": {
+    "name": "Example policy",
+    "notes": "This file is safe to copy and edit. Unknown keys (except `meta`) are rejected."
+  },
+  "rules": {
+    "tracker_set_cookie": {
+      "enabled": true,
+      "domains": [
+        "google-analytics.com",
+        "doubleclick.net",
+        "facebook.com",
+        "scorecardresearch.com",
+        "adnxs.com"
+      ]
+    }
+  }
+}
+

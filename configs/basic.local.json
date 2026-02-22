@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "name": "Local dev: MITM + dashboard + receipts (no DNS, no filter lists)",
+    "notes": "Safe default config for browser testing. Use docs/policy.example.json. Customize as needed."
+  },
+  "listen_host": "127.0.0.1",
+  "listen_port": 18081,
+  "pinned_hosts_file": "/tmp/pe_pinned_hosts.json",
+  "enable_mitm": true,
+  "tls_profile": "chrome",
+  "mitm_ca_cert_file": "/tmp/pe_ca_cert.pem",
+  "mitm_ca_key_file": "/tmp/pe_ca_key.pem",
+  "mitm_ca_generate_if_missing": true,
+  "mitm_ca_export_cert_file": "/tmp/pe_ca_cert_export.pem",
+  "policy_config_file": "docs/policy.example.json",
+  "policy_reload_interval_secs": 5,
+  "receipts_file": "/tmp/pe_receipts.json",
+  "receipts_flush_interval_secs": 10,
+  "metrics_log_interval_secs": 10,
+  "dashboard_port": 9090
+}
