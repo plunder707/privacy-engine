@@ -1,14 +1,14 @@
 # Privacy Engine (Rust)
 
-Privacy Engine is a Rust-based HTTPS interception proxy designed to strip trackers, block ads, and protect your privacy at the network level. Rather than running as a browser extension that only covers one tab, it sits between your entire device (or network) and the internet — decrypting, inspecting, rewriting, and re-encrypting traffic before it ever reaches your browser. It works across every app, every tab, and every device you route through it.
+Privacy Engine is a Rust based HTTPS interception proxy designed to strip trackers, block ads, and protect your privacy at the network level. Rather than running as a browser extension that only covers one tab, it sits between your entire device (or network) and the internet, its decrypting, inspecting, rewriting, and re-encrypting traffic before it ever reaches your browser. It works across every app, every tab, and every device you route through it.
 
 ## Features
 
-**Selective MITM Interception:** Intercepts HTTPS traffic using a locally-generated CA certificate. For hosts that reject the forged cert (payment processors, pinned apps), it automatically falls back to a transparent passthrough tunnel — no browser errors, no broken sites.
+**Selective MITM Interception:** Intercepts HTTPS traffic using a locally generated CA certificate. For hosts that reject the forged cert (payment processors, pinned apps), it automatically falls back to a transparent passthrough tunnel. No browser errors, no broken sites.
 
-**Tracker & Ad Blocking:** Loads EasyList and AdGuard-compatible filter lists (71,000+ rules). Strips tracker `<script>` tags and tracking pixels from HTML responses using a streaming rewriter. Injects cosmetic CSS to hide ad containers.
+**Tracker & Ad Blocking:** Loads EasyList and AdGuard compatible filter lists (71,000+ rules). Strips tracker `<script>` tags and tracking pixels from HTML responses using a streaming rewriter. Injects cosmetic CSS to hide ad containers.
 
-**DNS Pre-Filter:** Listens on a local UDP port and returns NXDOMAIN for blocked domains before a connection is even opened. Supports CNAME uncloaking — follows CNAME chains and blocks if the resolved target is a known tracker, even if the alias looks first-party.
+**DNS Pre-Filter:** Listens on a local UDP port and returns NXDOMAIN for blocked domains before a connection is even opened. Supports CNAME uncloaking and follows CNAME chains and blocks if the resolved target is a known tracker, even if the alias looks first-party.
 
 **Encrypted DNS:** Forwards DNS queries upstream over HTTPS (DoH) to Cloudflare or Quad9 instead of plaintext UDP. Also exposes its own DoH server endpoint so any device on your network can use it.
 
@@ -18,9 +18,9 @@ Privacy Engine is a Rust-based HTTPS interception proxy designed to strip tracke
 
 **Consent Enforcement:** Three consent levels — `essential_only`, `analytics_ok`, and `all` — with per-user profiles keyed by source IP. Lets different devices on the same network have different privacy levels.
 
-**Compression-Aware Rewriting:** Decompresses and rewrites HTML through the full stack — gzip, deflate, brotli, and chunked transfer encoding — then re-compresses with a corrected `Content-Length`. Doesn't skip rewriting just because the response is encoded.
+**Compression-Aware Rewriting:** Decompresses and rewrites HTML through the full stack using gzip, deflate, brotli, and chunked transfer encoding and then re-compresses with a corrected `Content-Length`. Doesn't skip rewriting just because the response is encoded.
 
-**Privacy Receipts:** Maintains a per-host audit trail of everything the engine touched — blocks, strips, rewrites, DNS queries, timestamps, counters. Persists to JSON and survives restarts.
+**Privacy Receipts:** Maintains a per-host audit trail of everything the engine touched and blocks, strips, rewrites, DNS queries, timestamps, counters. Persists to JSON and survives restarts.
 
 **Compliance Reports:** Generates text or HTML reports showing what each site attempted and what was blocked. Useful for auditing or understanding what a particular site is doing.
 
@@ -47,7 +47,7 @@ git clone <this repo>
 cd privacy-engine-rust
 ```
 
-Build and run with EasyList (recommended — downloads EasyList and starts with DNS + filter list support):
+Build and run with EasyList (recommended) downloads EasyList and starts with DNS + filter list support):
 
 ```bash
 ./scripts/run_easylist_local.sh
@@ -66,7 +66,7 @@ Trust the CA certificate the engine generates on first run. It's exported to `/t
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/pe_ca_cert_export.pem
 ```
 
-**Windows:** Download `ca.crt` from the dashboard Setup Wizard. Double-click it, choose to install to **Local Machine**, and manually select **Trusted Root Certification Authorities** as the store (do not use auto-select).
+**Windows:** Download `ca.crt` from the dashboard Setup Wizard. Double click it, choose to install to **Local Machine**, and manually select **Trusted Root Certification Authorities** as the store (do not use auto-select).
 
 **Linux:**
 ```bash
@@ -204,7 +204,7 @@ cargo build --release
 
 ## Customization
 
-**Change enforcement mode:** Set `"policy_mode"` to `"disabled"`, `"report_only"`, or `"enforce"` in the engine config. `report_only` logs what would have been blocked without actually blocking it — useful for evaluating impact before enabling enforcement.
+**Change enforcement mode:** Set `"policy_mode"` to `"disabled"`, `"report_only"`, or `"enforce"` in the engine config. `report_only` logs what would have been blocked without actually blocking it. Very useful for evaluating impact before enabling enforcement.
 
 **Add tracker domains:** Edit the `tracker_domains` list in your policy config file. Changes are picked up automatically within 5 seconds.
 
@@ -217,7 +217,7 @@ cargo build --release
 ## Safety
 
 - Do not expose the proxy listener on a public interface without adding authentication first. By default it is an open proxy.
-- The generated CA is a local root certificate authority. Treat the private key (`mitm_ca_key.pem`) like any root CA key — do not share it or commit it to version control.
+- The generated CA is a local root certificate authority. Treat the private key (`mitm_ca_key.pem`) like any root CA key, DO NOT share it or commit it to version control.
 - Remove the CA from your system trust store when you're done testing.
 - Pre-add payment processors and cert-pinned apps to the passthrough list. Stripe, Google Pay, PayPal, and similar services use certificate pinning and will not function correctly under MITM interception.
 
@@ -241,7 +241,7 @@ cargo build --release
 
 **Longer-term vision:**
 
-The proxy approach has real limits — it requires a CA cert, a proxy setting on every device, and can't intercept cert-pinned apps. The end goal is to embed this engine natively inside a [Servo](https://servo.org)-based browser. Same language (Rust), no MITM certificate required, hooks at the DOM and API level rather than the byte stream. The hard part — the policy engine, filter parser, consent system, streaming rewriter, DNS pipeline — is already built. See [`docs/VISION.md`](docs/VISION.md) for the full plan.
+The proxy approach has real limits — it requires a CA cert, a proxy setting on every device, and can't intercept cert-pinned apps. The end goal is to embed this engine natively inside a [Servo](https://servo.org)-based browser. Same language (Rust), no MITM certificate required, hooks at the DOM and API level rather than the byte stream. The hard part of the policy engine, filter parser, consent system, streaming rewriter, DNS pipeline is already built. See [`docs/VISION.md`](docs/VISION.md) for the full plan.
 
 ## Dependencies
 
