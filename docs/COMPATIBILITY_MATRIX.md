@@ -1,7 +1,5 @@
 # Compatibility Matrix
 
-> Updated: 2026-02-15 10:01 UTC (Codex)
-
 This matrix tracks transport and interception compatibility for the Rust engine by client and mode. It also tracks the major HTTP response shapes relevant to body rewriting.
 
 Legend:
