@@ -1,6 +1,5 @@
 # Platforms: How Users Run This
 
-> Updated: 2026-02-15 09:28 UTC (Codex)
 
 This project is a **selective privacy gateway**. Users route traffic through it and it enforces privacy rules when safe.
 
