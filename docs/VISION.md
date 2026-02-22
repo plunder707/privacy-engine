@@ -86,7 +86,7 @@ Embed the Privacy Engine natively inside a browser engine instead of running as 
 
 > "Most people can build a UI. Most people can fork an engine. Very few people can build
 > a logic engine that successfully snipes 71,000 trackers and defeats registration walls
-> in a streaming Rust pipe." — Gemini
+> in a streaming Rust pipe." — Some AI :)
 
 The privacy engine IS the hard part, and it's built. The browser shell and native integration are well-understood engineering problems with clear paths.
 
