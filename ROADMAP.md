@@ -1,7 +1,5 @@
 # Privacy Engine Rust Roadmap
 
-> Updated: 2026-02-15 10:01 UTC (Codex)
->
 > This file is the high-level roadmap. The detailed milestone checklist and narrative lives in `docs/NEXT_PHASE.md` (do not treat older notes elsewhere as canonical).
 
 ## Shipped (Current State)
