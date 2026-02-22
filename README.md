@@ -8,19 +8,19 @@ Privacy Engine is a Rust based HTTPS interception proxy designed to strip tracke
 
 **Tracker & Ad Blocking:** Loads EasyList and AdGuard compatible filter lists (71,000+ rules). Strips tracker `<script>` tags and tracking pixels from HTML responses using a streaming rewriter. Injects cosmetic CSS to hide ad containers.
 
-**DNS Pre-Filter:** Listens on a local UDP port and returns NXDOMAIN for blocked domains before a connection is even opened. Supports CNAME uncloaking and follows CNAME chains and blocks if the resolved target is a known tracker, even if the alias looks first-party.
+**DNS Pre-Filter:** Listens on a local UDP port and returns NXDOMAIN for blocked domains before a connection is even opened. Supports CNAME uncloaking and follows CNAME chains and blocks if the resolved target is a known tracker, even if the alias looks first party.
 
 **Encrypted DNS:** Forwards DNS queries upstream over HTTPS (DoH) to Cloudflare or Quad9 instead of plaintext UDP. Also exposes its own DoH server endpoint so any device on your network can use it.
 
-**Query Parameter Stripping:** Removes tracking parameters from outbound request URLs before they reach the server — `fbclid`, `gclid`, `utm_source`, `utm_medium`, `utm_campaign`, `_ga`, `msclkid`, and more.
+**Query Parameter Stripping:** Removes tracking parameters from outbound request URLs before they reach the server `fbclid`, `gclid`, `utm_source`, `utm_medium`, `utm_campaign`, `_ga`, `msclkid`, and more.
 
 **Cookie & Header Privacy:** Strips `Set-Cookie` headers from tracker domain responses. Removes cache-fingerprinting headers (`Last-Modified`, `X-Cache`, `If-None-Match`, etc.). Normalizes the `Referer` header on outbound requests to tracker domains.
 
-**Consent Enforcement:** Three consent levels — `essential_only`, `analytics_ok`, and `all` — with per-user profiles keyed by source IP. Lets different devices on the same network have different privacy levels.
+**Consent Enforcement:** Three consent levels `essential_only`, `analytics_ok`, and `all` with per user profiles keyed by source IP. Lets different devices on the same network have different privacy levels.
 
 **Compression-Aware Rewriting:** Decompresses and rewrites HTML through the full stack using gzip, deflate, brotli, and chunked transfer encoding and then re-compresses with a corrected `Content-Length`. Doesn't skip rewriting just because the response is encoded.
 
-**Privacy Receipts:** Maintains a per-host audit trail of everything the engine touched and blocks, strips, rewrites, DNS queries, timestamps, counters. Persists to JSON and survives restarts.
+**Privacy Receipts:** Maintains a per host audit trail of everything the engine touched and blocks, strips, rewrites, DNS queries, timestamps, counters. Persists to JSON and survives restarts.
 
 **Compliance Reports:** Generates text or HTML reports showing what each site attempted and what was blocked. Useful for auditing or understanding what a particular site is doing.
 
