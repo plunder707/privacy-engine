@@ -1,7 +1,5 @@
 # Browser Testing (Chrome + Firefox)
 
-> Updated: 2026-02-15 10:01 UTC (Codex)
-
 This guide validates **explicit proxy MITM** with real desktop browsers, plus the “privacy product” features (cookies, DNS, rewriting, receipts).
 
 Safety notes:
