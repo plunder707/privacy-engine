@@ -1,6 +1,5 @@
 # Engine Config (JSON)
 
-> Updated: 2026-02-15 10:01 UTC (Codex)
 
 The engine supports a single runtime config file to avoid long `cargo run ... --flag --flag ...` invocations and to provide a foundation for a future UI/launcher.
 
