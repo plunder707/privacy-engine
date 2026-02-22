@@ -1,7 +1,5 @@
 # Privacy Receipts + Compliance Reports
 
-> Updated: 2026-02-15 09:28 UTC (Codex)
-
 “Receipts” are **local, aggregated summaries** of what the engine decided and what it changed. They are designed to be:
 
 - explainable (“what happened and why”)
