@@ -1,6 +1,6 @@
 # Policy Config (JSON) + Hot Reload
 
-> Updated: 2026-02-15 07:07 UTC (Codex)
+> Updated: 2026-02-15 07:07 UTC 
 
 This engine supports a **strict JSON policy config** that can be hot-reloaded at runtime. Policy is shared across:
 
