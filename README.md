@@ -2,6 +2,8 @@
 
 Privacy Engine is a Rust based HTTPS interception proxy designed to strip trackers, block ads, and protect your privacy at the network level. Rather than running as a browser extension that only covers one tab, it sits between your entire device (or network) and the internet, its decrypting, inspecting, rewriting, and re-encrypting traffic before it ever reaches your browser. It works across every app, every tab, and every device you route through it.
 
+**Disclaimer:** This tool is intended for personal use on networks and devices you own or have explicit permission to monitor. Intercepting traffic without authorization is illegal in most jurisdictions. The MITM capability is designed for privacy protection on your own traffic — not for inspecting others. Use responsibly.
+
 ## Features
 
 **Selective MITM Interception:** Intercepts HTTPS traffic using a locally generated CA certificate. For hosts that reject the forged cert (payment processors, pinned apps), it automatically falls back to a transparent passthrough tunnel. No browser errors, no broken sites.
