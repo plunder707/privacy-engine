@@ -2,7 +2,7 @@
 
 Privacy Engine is a Rust based HTTPS interception proxy designed to strip trackers, block ads, and protect your privacy at the network level. Rather than running as a browser extension that only covers one tab, it sits between your entire device (or network) and the internet, its decrypting, inspecting, rewriting, and re-encrypting traffic before it ever reaches your browser. It works across every app, every tab, and every device you route through it.
 
-**Disclaimer:** This tool is intended for personal use on networks and devices you own or have explicit permission to monitor. Intercepting traffic without authorization is illegal in most jurisdictions. The MITM capability is designed for privacy protection on your own traffic — not for inspecting others. Use responsibly.
+**Disclaimer:** This tool is intended for personal use on networks and devices you own or have explicit permission to monitor. Intercepting traffic without authorization is illegal in most jurisdictions. The MITM capability is designed for privacy protection on your own traffic.. NOT for inspecting others. Use responsibly.
 
 ## Features
 
@@ -221,7 +221,7 @@ cargo build --release
 - Do not expose the proxy listener on a public interface without adding authentication first. By default it is an open proxy.
 - The generated CA is a local root certificate authority. Treat the private key (`mitm_ca_key.pem`) like any root CA key, DO NOT share it or commit it to version control.
 - Remove the CA from your system trust store when you're done testing.
-- Pre-add payment processors and cert-pinned apps to the passthrough list. Stripe, Google Pay, PayPal, and similar services use certificate pinning and will not function correctly under MITM interception.
+- Pre add payment processors and cert-pinned apps to the passthrough list. Stripe, Google Pay, PayPal, and similar services use certificate pinning and will not function correctly under MITM interception.
 
 ## What's Next
 
@@ -243,7 +243,7 @@ cargo build --release
 
 **Longer-term vision:**
 
-The proxy approach has real limits — it requires a CA cert, a proxy setting on every device, and can't intercept cert-pinned apps. The end goal is to embed this engine natively inside a [Servo](https://servo.org)-based browser. Same language (Rust), no MITM certificate required, hooks at the DOM and API level rather than the byte stream. The hard part of the policy engine, filter parser, consent system, streaming rewriter, DNS pipeline is already built. See [`docs/VISION.md`](docs/VISION.md) for the full plan.
+The proxy approach has real limits. It requires a CA cert, a proxy setting on every device, and can't intercept cert pinned apps. The end goal is to embed this engine natively inside a [Servo](https://servo.org)-based browser. Same language (Rust), no MITM certificate required, hooks at the DOM and API level rather than the byte stream. The hard part of the policy engine, filter parser, consent system, streaming rewriter, DNS pipeline is already built. See [`docs/VISION.md`](docs/VISION.md) for the full plan.
 
 ## Dependencies
 
