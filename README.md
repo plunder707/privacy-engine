@@ -43,7 +43,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Clone the repository:
 
 ```bash
-git clone <this repo>
+git clone https://github.com/plunder707/privacy-engine.git
 cd privacy-engine-rust
 ```
 
