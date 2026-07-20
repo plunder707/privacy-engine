@@ -5,6 +5,8 @@ use tracing::info;
 pub struct Metrics {
     connection_total: AtomicU64,
     passthrough_tunnel_total: AtomicU64,
+    never_intercept_bypass_total: AtomicU64,
+    upstream_connect_failure_total: AtomicU64,
     mitm_attempt_total: AtomicU64,
     mitm_success_total: AtomicU64,
     mitm_failure_total: AtomicU64,
@@ -31,6 +33,8 @@ pub struct Metrics {
 pub struct MetricsSnapshot {
     pub connection_total: u64,
     pub passthrough_tunnel_total: u64,
+    pub never_intercept_bypass_total: u64,
+    pub upstream_connect_failure_total: u64,
     pub mitm_attempt_total: u64,
     pub mitm_success_total: u64,
     pub mitm_failure_total: u64,
@@ -60,6 +64,16 @@ impl Metrics {
 
     pub fn inc_passthrough_tunnel_total(&self) {
         self.passthrough_tunnel_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_never_intercept_bypass_total(&self) {
+        self.never_intercept_bypass_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_upstream_connect_failure_total(&self) {
+        self.upstream_connect_failure_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -156,6 +170,10 @@ impl Metrics {
         MetricsSnapshot {
             connection_total: self.connection_total.load(Ordering::Relaxed),
             passthrough_tunnel_total: self.passthrough_tunnel_total.load(Ordering::Relaxed),
+            never_intercept_bypass_total: self.never_intercept_bypass_total.load(Ordering::Relaxed),
+            upstream_connect_failure_total: self
+                .upstream_connect_failure_total
+                .load(Ordering::Relaxed),
             mitm_attempt_total: self.mitm_attempt_total.load(Ordering::Relaxed),
             mitm_success_total: self.mitm_success_total.load(Ordering::Relaxed),
             mitm_failure_total: self.mitm_failure_total.load(Ordering::Relaxed),
@@ -190,6 +208,8 @@ impl Metrics {
             trigger,
             connection_total = s.connection_total,
             passthrough_tunnel_total = s.passthrough_tunnel_total,
+            never_intercept_bypass_total = s.never_intercept_bypass_total,
+            upstream_connect_failure_total = s.upstream_connect_failure_total,
             mitm_attempt_total = s.mitm_attempt_total,
             mitm_success_total = s.mitm_success_total,
             mitm_failure_total = s.mitm_failure_total,
@@ -224,6 +244,8 @@ mod tests {
         let m = Metrics::default();
         m.inc_connection_total();
         m.inc_passthrough_tunnel_total();
+        m.inc_never_intercept_bypass_total();
+        m.inc_upstream_connect_failure_total();
         m.inc_mitm_attempt_total();
         m.inc_mitm_success_total();
         m.inc_mitm_failure_total();
@@ -248,6 +270,8 @@ mod tests {
         let s = m.snapshot();
         assert_eq!(s.connection_total, 1);
         assert_eq!(s.passthrough_tunnel_total, 1);
+        assert_eq!(s.never_intercept_bypass_total, 1);
+        assert_eq!(s.upstream_connect_failure_total, 1);
         assert_eq!(s.mitm_attempt_total, 1);
         assert_eq!(s.mitm_success_total, 1);
         assert_eq!(s.mitm_failure_total, 1);

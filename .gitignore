@@ -3,6 +3,7 @@
 # Auto-generated CA files (never commit the private key)
 mitm_ca_key.pem
 mitm_ca_cert.pem
+certs/
 
 # Auto-generated runtime state
 sni_pinned_hosts.json

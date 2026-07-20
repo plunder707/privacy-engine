@@ -1691,7 +1691,7 @@ mod tests {
     async fn load_missing_file_is_empty() {
         let path = temp_file("receipts_missing");
         let store = ReceiptStore::load(&path).expect("load should succeed");
-        assert_eq!(store.flush_if_dirty().expect("flush"), false);
+        assert!(!store.flush_if_dirty().expect("flush"));
     }
 
     #[tokio::test]

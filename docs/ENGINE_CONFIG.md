@@ -23,6 +23,10 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 - `listen_host` (string)
 - `listen_port` (number)
 - `pinned_hosts_file` (string path)
+- `never_intercept_hosts` (array of hostnames; extends the built-in `localhost` bypass)
+- `never_intercept_cidrs` (array of IP CIDRs; extends the built-in `127.0.0.0/8` and `::1/128` bypass)
+- `auto_pin_reject_threshold` (number, default `2`)
+- `auto_pin_reject_window_secs` (number, default `300`)
 
 - `enable_mitm` (bool)
 - `mitm_ca_cert_file` (string path)
@@ -64,5 +68,15 @@ See:
 
 Operational note:
 
+- Loopback is a non-disableable MITM bypass. Clients should also carry
+  `NO_PROXY/no_proxy=localhost,127.0.0.1,::1`; `scripts/privacy_engine_env.sh`
+  adds those entries without replacing existing exclusions.
+- Run `scripts/pe-trust.sh --system` once per machine, then
+  `scripts/pe-trust.sh --check --system` to verify it. The script uses a
+  managed CA bundle and environment variables, so Python virtual environments
+  inherit trust without modifying each environment's `certifi` package.
 - The dashboard now includes setup actions (`/download/ca.crt`, pinned-host reset button).
-- Auto-pin after client TLS rejection is suppressed during a fixed 60-second startup grace period.
+- Auto-pin is suppressed during a fixed 60-second startup grace period. After
+  that, a host must reach `auto_pin_reject_threshold` TLS failures inside
+  `auto_pin_reject_window_secs`; the first observation is logged/receipted as
+  pending rather than silently persisted.

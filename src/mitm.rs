@@ -153,6 +153,10 @@ impl MitmError {
         matches!(self, Self::UpstreamTlsHandshake(_))
     }
 
+    pub fn is_upstream_connect_failure(&self) -> bool {
+        matches!(self, Self::UpstreamConnect(_))
+    }
+
     pub fn is_benign_peer_close(&self) -> bool {
         match self {
             Self::Relay(e) => {
@@ -1851,12 +1855,12 @@ mod tests {
             .expect("server config h2h1");
 
         let h1_alpn: HashSet<Vec<u8>> = h1.alpn_protocols.iter().cloned().collect();
-        assert!(h1_alpn.contains(&b"http/1.1".to_vec()));
-        assert!(!h1_alpn.contains(&b"h2".to_vec()));
+        assert!(h1_alpn.iter().any(|protocol| protocol == b"http/1.1"));
+        assert!(!h1_alpn.iter().any(|protocol| protocol == b"h2"));
 
         let h2_alpn: HashSet<Vec<u8>> = h2.alpn_protocols.iter().cloned().collect();
-        assert!(h2_alpn.contains(&b"http/1.1".to_vec()));
-        assert!(h2_alpn.contains(&b"h2".to_vec()));
+        assert!(h2_alpn.iter().any(|protocol| protocol == b"http/1.1"));
+        assert!(h2_alpn.iter().any(|protocol| protocol == b"h2"));
     }
 
     fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
@@ -2305,10 +2309,7 @@ mod tests {
     #[test]
     fn rewrite_recompress_error_counts_as_skipped() {
         fn fail_compress(_body: &[u8], _encoding: &str) -> io::Result<Vec<u8>> {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "forced compress failure",
-            ))
+            Err(io::Error::other("forced compress failure"))
         }
 
         let html = b"<html><head><script src=\"https://google-analytics.com/analytics.js\"></script></head><body>Hello</body></html>";

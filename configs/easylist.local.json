@@ -6,11 +6,15 @@
   "listen_host": "127.0.0.1",
   "listen_port": 18081,
   "pinned_hosts_file": "/tmp/pe_pinned_hosts.json",
+  "never_intercept_hosts": [],
+  "never_intercept_cidrs": [],
+  "auto_pin_reject_threshold": 2,
+  "auto_pin_reject_window_secs": 300,
   "enable_mitm": true,
-  "mitm_ca_cert_file": "/tmp/pe_ca_cert.pem",
-  "mitm_ca_key_file": "/tmp/pe_ca_key.pem",
+  "mitm_ca_cert_file": "certs/ca_cert.pem",
+  "mitm_ca_key_file": "certs/ca_key.pem",
   "mitm_ca_generate_if_missing": true,
-  "mitm_ca_export_cert_file": "/tmp/pe_ca_cert_export.pem",
+  "mitm_ca_export_cert_file": "certs/ca_cert_export.pem",
   "tls_profile": "chrome",
   "policy_config_file": "docs/policy_full.json",
   "policy_mode": "enforce",
@@ -30,4 +34,3 @@
   "cert_log_file": "/tmp/pe_cert_log.jsonl",
   "cert_pin_file": "/tmp/pe_cert_pins.json"
 }
-

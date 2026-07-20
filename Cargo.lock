@@ -1045,6 +1045,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "lol_html",
  "rcgen",
  "ring",

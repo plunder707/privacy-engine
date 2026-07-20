@@ -11,8 +11,7 @@ EASYLIST_PATH="/tmp/easylist.txt"
 
 if [[ ! -s "${EASYLIST_PATH}" ]]; then
   echo "Downloading EasyList to ${EASYLIST_PATH} ..." >&2
-  curl -fsSL "${EASYLIST_URL}" -o "${EASYLIST_PATH}"
+  curl --noproxy '*' -fsSL "${EASYLIST_URL}" -o "${EASYLIST_PATH}"
 fi
 
 exec ./scripts/run_engine_config.sh "${1:-configs/easylist.local.json}"
-

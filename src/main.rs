@@ -1,3 +1,4 @@
+mod auto_pin;
 mod cert_pin;
 mod dashboard;
 mod dns_filter;
@@ -5,6 +6,7 @@ mod engine_config;
 mod filter_list;
 mod filter_list_parser;
 mod host_store;
+mod intercept_bypass;
 mod metrics;
 mod mitm;
 mod policy;
@@ -56,6 +58,22 @@ struct Args {
     /// JSON file path containing pinned/passthrough hostnames.
     #[arg(long, default_value = "sni_pinned_hosts.json")]
     pinned_hosts_file: PathBuf,
+
+    /// Hostname that must always bypass MITM interception (repeatable).
+    #[arg(long, value_name = "HOST")]
+    never_intercept_host: Vec<String>,
+
+    /// IP CIDR that must always bypass MITM interception (repeatable).
+    #[arg(long, value_name = "CIDR")]
+    never_intercept_cidr: Vec<String>,
+
+    /// TLS failure observations required before a host is persisted as passthrough.
+    #[arg(long, default_value_t = 2)]
+    auto_pin_reject_threshold: u64,
+
+    /// Time window in seconds for repeated TLS failure observations.
+    #[arg(long, default_value_t = 300)]
+    auto_pin_reject_window_secs: u64,
 
     /// Enable MITM interception path for non-pinned TLS hosts.
     #[arg(long, default_value_t = false)]
@@ -196,6 +214,10 @@ fn apply_engine_config(args: &mut Args, cfg: engine_config::EngineConfig) {
     args.listen_host = cfg.listen_host;
     args.listen_port = cfg.listen_port;
     args.pinned_hosts_file = cfg.pinned_hosts_file;
+    args.never_intercept_host = cfg.never_intercept_hosts;
+    args.never_intercept_cidr = cfg.never_intercept_cidrs;
+    args.auto_pin_reject_threshold = cfg.auto_pin_reject_threshold;
+    args.auto_pin_reject_window_secs = cfg.auto_pin_reject_window_secs;
 
     args.enable_mitm = cfg.enable_mitm;
     args.mitm_ca_cert_file = cfg.mitm_ca_cert_file;
@@ -513,10 +535,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pinned_hosts = Arc::new(host_store::PinnedHosts::load(&args.pinned_hosts_file)?);
+    let intercept_bypass = Arc::new(intercept_bypass::InterceptBypass::new(
+        &args.never_intercept_host,
+        &args.never_intercept_cidr,
+    )?);
+    let auto_pin_tracker = Arc::new(auto_pin::AutoPinTracker::new(
+        args.auto_pin_reject_threshold,
+        Duration::from_secs(args.auto_pin_reject_window_secs),
+    )?);
     info!(
         "Loaded {} pinned hosts from {}",
         pinned_hosts.len()?,
         pinned_hosts.path().display()
+    );
+    info!(
+        event = "intercept_bypass_initialized",
+        builtin_loopback = true,
+        configured_hosts = args.never_intercept_host.len(),
+        configured_cidrs = args.never_intercept_cidr.len(),
+        "MITM never-intercept policy initialized"
+    );
+    info!(
+        event = "auto_pin_tracker_initialized",
+        reject_threshold = auto_pin_tracker.threshold(),
+        reject_window_secs = auto_pin_tracker.window().as_secs(),
+        "TLS auto-pin learning initialized"
     );
 
     let receipts_store = if let Some(path) = args.receipts_file.as_ref() {
@@ -678,6 +721,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             doh_stats: doh_stats.clone(),
             mitm_ca_export_cert_file: args.mitm_ca_export_cert_file.clone(),
             auto_pin_grace_period_secs: AUTO_PIN_GRACE_PERIOD_SECS,
+            auto_pin_reject_threshold: auto_pin_tracker.threshold(),
+            auto_pin_reject_window_secs: auto_pin_tracker.window().as_secs(),
         };
         tokio::spawn(async move {
             dashboard::run(
@@ -817,6 +862,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (mut client_stream, client_addr) = listener.accept().await?;
         let pinned_hosts = Arc::clone(&pinned_hosts);
+        let intercept_bypass = Arc::clone(&intercept_bypass);
+        let auto_pin_tracker = Arc::clone(&auto_pin_tracker);
         let mitm_engine = mitm_engine.clone();
         let metrics = Arc::clone(&metrics);
         let policy_engine = Arc::clone(&policy_engine);
@@ -824,17 +871,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.inc_connection_total();
 
         tokio::spawn(async move {
-            match handle_connection(
-                &mut client_stream,
-                client_addr,
-                &pinned_hosts,
-                mitm_engine.as_deref(),
-                metrics.as_ref(),
-                policy_engine.as_ref(),
-                receipts_store.as_deref(),
-            )
-            .await
-            {
+            let deps = ConnectionDeps {
+                pinned_hosts: pinned_hosts.as_ref(),
+                intercept_bypass: intercept_bypass.as_ref(),
+                auto_pin_tracker: auto_pin_tracker.as_ref(),
+                mitm_engine: mitm_engine.as_deref(),
+                metrics: metrics.as_ref(),
+                policy_engine: policy_engine.as_ref(),
+                receipts_store: receipts_store.as_deref(),
+            };
+            match handle_connection(&mut client_stream, client_addr, deps).await {
                 Ok(()) => {
                     info!(
                         event = "connection_completed",
@@ -856,14 +902,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ConnectionDeps<'a> {
+    pinned_hosts: &'a host_store::PinnedHosts,
+    intercept_bypass: &'a intercept_bypass::InterceptBypass,
+    auto_pin_tracker: &'a auto_pin::AutoPinTracker,
+    mitm_engine: Option<&'a mitm::MitmEngine>,
+    metrics: &'a metrics::Metrics,
+    policy_engine: &'a policy::PolicyEngine,
+    receipts_store: Option<&'a receipts::ReceiptStore>,
+}
+
 async fn handle_connection(
     client_stream: &mut TcpStream,
     client_addr: SocketAddr,
-    pinned_hosts: &host_store::PinnedHosts,
-    mitm_engine: Option<&mitm::MitmEngine>,
-    metrics: &metrics::Metrics,
-    policy_engine: &policy::PolicyEngine,
-    receipts_store: Option<&receipts::ReceiptStore>,
+    deps: ConnectionDeps<'_>,
 ) -> io::Result<()> {
     // Peek at incoming bytes to determine protocol mode.
     let mut buffer = [0u8; MAX_PEEK_BYTES];
@@ -886,24 +939,20 @@ async fn handle_connection(
             mode = "explicit_connect",
             "protocol mode detected"
         );
-        return handle_connect_tunnel(
-            client_stream,
-            client_addr,
-            pinned_hosts,
-            mitm_engine,
-            metrics,
-            policy_engine,
-            receipts_store,
-        )
-        .await;
+        return handle_connect_tunnel(client_stream, client_addr, deps).await;
     }
 
     // Transparent mode fallback: parse SNI from TLS ClientHello
     if let Some(sni) = tls_parser::parse_sni(peeked) {
         let target_addr = format!("{}:443", sni);
         let normalized_sni = sni.to_ascii_lowercase();
-        let host_is_pinned = pinned_hosts.contains(&normalized_sni)?;
-        let decision = decide_tls_routing(host_is_pinned, mitm_engine.is_some());
+        let host_is_pinned = deps.pinned_hosts.contains(&normalized_sni)?;
+        let bypass_reason = deps.intercept_bypass.reason_for_host(&normalized_sni);
+        let decision = decide_tls_routing(
+            host_is_pinned,
+            deps.mitm_engine.is_some(),
+            bypass_reason.is_some(),
+        );
 
         match decision {
             TlsRoutingDecision::AttemptMitm => {
@@ -914,27 +963,31 @@ async fn handle_connection(
                     &target_addr,
                     decision,
                     "host_not_pinned_and_mitm_enabled",
-                    receipts_store,
+                    deps.receipts_store,
                 );
-                if let Some(engine) = mitm_engine {
+                if let Some(engine) = deps.mitm_engine {
                     let ctx = MitmInterceptCtx {
                         client_addr,
                         flow: "transparent",
                         target_addr: &target_addr,
                         host: &normalized_sni,
                     };
-                    let deps = MitmInterceptDeps {
-                        pinned_hosts,
+                    let mitm_deps = MitmInterceptDeps {
+                        pinned_hosts: deps.pinned_hosts,
+                        auto_pin_tracker: deps.auto_pin_tracker,
                         engine,
-                        metrics,
-                        policy_engine,
-                        receipts_store,
+                        metrics: deps.metrics,
+                        policy_engine: deps.policy_engine,
+                        receipts_store: deps.receipts_store,
                     };
-                    return run_mitm_intercept(client_stream, ctx, deps).await;
+                    return run_mitm_intercept(client_stream, ctx, mitm_deps).await;
                 }
             }
             TlsRoutingDecision::Passthrough => {
-                let reason = if host_is_pinned {
+                let reason = if let Some(reason) = bypass_reason {
+                    deps.metrics.inc_never_intercept_bypass_total();
+                    reason.as_str()
+                } else if host_is_pinned {
                     "host_is_pinned"
                 } else {
                     "mitm_disabled"
@@ -946,9 +999,9 @@ async fn handle_connection(
                     &target_addr,
                     decision,
                     reason,
-                    receipts_store,
+                    deps.receipts_store,
                 );
-                tunnel(client_stream, &target_addr, None, metrics).await?;
+                tunnel(client_stream, &target_addr, None, deps.metrics).await?;
                 return Ok(());
             }
         }
@@ -962,7 +1015,7 @@ async fn handle_connection(
             mode = "explicit_http_proxy",
             "protocol mode detected"
         );
-        return handle_http_proxy(client_stream, client_addr, metrics).await;
+        return handle_http_proxy(client_stream, client_addr, deps.metrics).await;
     }
 
     warn!(
@@ -977,11 +1030,7 @@ async fn handle_connection(
 async fn handle_connect_tunnel(
     client_stream: &mut TcpStream,
     client_addr: SocketAddr,
-    pinned_hosts: &host_store::PinnedHosts,
-    mitm_engine: Option<&mitm::MitmEngine>,
-    metrics: &metrics::Metrics,
-    policy_engine: &policy::PolicyEngine,
-    receipts_store: Option<&receipts::ReceiptStore>,
+    deps: ConnectionDeps<'_>,
 ) -> io::Result<()> {
     let (request_head, buffered_after_headers) = read_until_headers_complete(client_stream).await?;
 
@@ -1007,12 +1056,20 @@ async fn handle_connect_tunnel(
     let mut connect_host = None;
     let mut host_is_pinned = false;
     if let Some(host) = host_store::host_from_authority(&target_addr) {
-        host_is_pinned = pinned_hosts.contains(&host)?;
+        host_is_pinned = deps.pinned_hosts.contains(&host)?;
+        let bypass_reason = deps.intercept_bypass.reason_for_host(&host);
         connect_host = Some(host.clone());
-        let mut decision = decide_tls_routing(host_is_pinned, mitm_engine.is_some());
-        let mut reason = if host_is_pinned {
+        let mut decision = decide_tls_routing(
+            host_is_pinned,
+            deps.mitm_engine.is_some(),
+            bypass_reason.is_some(),
+        );
+        let mut reason = if let Some(reason) = bypass_reason {
+            deps.metrics.inc_never_intercept_bypass_total();
+            reason.as_str()
+        } else if host_is_pinned {
             "host_is_pinned"
-        } else if mitm_engine.is_some() {
+        } else if deps.mitm_engine.is_some() {
             "host_not_pinned_and_mitm_enabled"
         } else {
             "mitm_disabled"
@@ -1028,12 +1085,13 @@ async fn handle_connect_tunnel(
             &target_addr,
             decision,
             reason,
-            receipts_store,
+            deps.receipts_store,
         );
     }
 
-    if let (Some(engine), Some(host)) = (mitm_engine, connect_host.as_deref()) {
-        if can_attempt_connect_mitm(host_is_pinned, true, has_early_tunnel_bytes) {
+    if let (Some(engine), Some(host)) = (deps.mitm_engine, connect_host.as_deref()) {
+        let bypassed = deps.intercept_bypass.reason_for_host(host).is_some();
+        if can_attempt_connect_mitm(host_is_pinned, true, has_early_tunnel_bytes, bypassed) {
             client_stream
                 .write_all(
                     b"HTTP/1.1 200 Connection established\r\n\
@@ -1051,11 +1109,12 @@ async fn handle_connect_tunnel(
                     host,
                 },
                 MitmInterceptDeps {
-                    pinned_hosts,
+                    pinned_hosts: deps.pinned_hosts,
+                    auto_pin_tracker: deps.auto_pin_tracker,
                     engine,
-                    metrics,
-                    policy_engine,
-                    receipts_store,
+                    metrics: deps.metrics,
+                    policy_engine: deps.policy_engine,
+                    receipts_store: deps.receipts_store,
                 },
             )
             .await?;
@@ -1063,7 +1122,7 @@ async fn handle_connect_tunnel(
         }
 
         if has_early_tunnel_bytes
-            && decide_tls_routing(host_is_pinned, true) == TlsRoutingDecision::AttemptMitm
+            && decide_tls_routing(host_is_pinned, true, bypassed) == TlsRoutingDecision::AttemptMitm
         {
             warn!(
                 event = "mitm_skipped",
@@ -1077,7 +1136,7 @@ async fn handle_connect_tunnel(
         }
     }
 
-    metrics.inc_passthrough_tunnel_total();
+    deps.metrics.inc_passthrough_tunnel_total();
     match TcpStream::connect(&target_addr).await {
         Ok(mut server_stream) => {
             client_stream
@@ -1107,6 +1166,7 @@ async fn handle_connect_tunnel(
             Ok(())
         }
         Err(e) => {
+            deps.metrics.inc_upstream_connect_failure_total();
             warn!("Failed to connect CONNECT target {}: {}", target_addr, e);
             send_http_error(
                 client_stream,
@@ -1134,8 +1194,12 @@ impl TlsRoutingDecision {
     }
 }
 
-fn decide_tls_routing(host_is_pinned: bool, mitm_enabled: bool) -> TlsRoutingDecision {
-    if !host_is_pinned && mitm_enabled {
+fn decide_tls_routing(
+    host_is_pinned: bool,
+    mitm_enabled: bool,
+    interception_bypassed: bool,
+) -> TlsRoutingDecision {
+    if !host_is_pinned && mitm_enabled && !interception_bypassed {
         TlsRoutingDecision::AttemptMitm
     } else {
         TlsRoutingDecision::Passthrough
@@ -1146,9 +1210,11 @@ fn can_attempt_connect_mitm(
     host_is_pinned: bool,
     mitm_enabled: bool,
     has_early_tunnel_bytes: bool,
+    interception_bypassed: bool,
 ) -> bool {
     !has_early_tunnel_bytes
-        && decide_tls_routing(host_is_pinned, mitm_enabled) == TlsRoutingDecision::AttemptMitm
+        && decide_tls_routing(host_is_pinned, mitm_enabled, interception_bypassed)
+            == TlsRoutingDecision::AttemptMitm
 }
 
 fn pin_host_after_tls_rejection(
@@ -1156,6 +1222,71 @@ fn pin_host_after_tls_rejection(
     host: &str,
 ) -> io::Result<bool> {
     pinned_hosts.add_and_persist(host)
+}
+
+fn observe_auto_pin_failure(
+    ctx: MitmInterceptCtx<'_>,
+    deps: MitmInterceptDeps<'_>,
+    reject_type: &'static str,
+) -> io::Result<()> {
+    if deps
+        .pinned_hosts
+        .in_grace_period(Duration::from_secs(AUTO_PIN_GRACE_PERIOD_SECS))
+    {
+        warn!(
+            event = "host_auto_pin_suppressed",
+            flow = ctx.flow,
+            client_addr = %ctx.client_addr,
+            host = ctx.host,
+            target_addr = ctx.target_addr,
+            pinned_hosts_file = %deps.pinned_hosts.path().display(),
+            grace_period_secs = AUTO_PIN_GRACE_PERIOD_SECS,
+            reason = "startup_grace_period",
+            reject_type,
+            "suppressed auto-pin observation during startup grace period"
+        );
+        return Ok(());
+    }
+
+    let observation = deps.auto_pin_tracker.observe(ctx.host)?;
+    if !observation.should_pin {
+        if let Some(store) = deps.receipts_store {
+            store.record_tls_routing_decision(ctx.flow, ctx.host, "observe", "auto_pin_pending");
+        }
+        info!(
+            event = "host_auto_pin_pending",
+            flow = ctx.flow,
+            client_addr = %ctx.client_addr,
+            host = ctx.host,
+            target_addr = ctx.target_addr,
+            reject_type,
+            failure_count = observation.failure_count,
+            reject_threshold = deps.auto_pin_tracker.threshold(),
+            reject_window_secs = deps.auto_pin_tracker.window().as_secs(),
+            "TLS failure observed; auto-pin threshold not yet reached"
+        );
+        return Ok(());
+    }
+
+    if pin_host_after_tls_rejection(deps.pinned_hosts, ctx.host)? {
+        deps.metrics.inc_host_auto_pinned_total();
+        if let Some(store) = deps.receipts_store {
+            store.record_host_auto_pinned(ctx.host);
+        }
+        warn!(
+            event = "host_auto_pinned",
+            flow = ctx.flow,
+            client_addr = %ctx.client_addr,
+            host = ctx.host,
+            target_addr = ctx.target_addr,
+            pinned_hosts_file = %deps.pinned_hosts.path().display(),
+            reason = reject_type,
+            failure_count = observation.failure_count,
+            reject_threshold = deps.auto_pin_tracker.threshold(),
+            "added host to pinned list after repeated TLS failures"
+        );
+    }
+    Ok(())
 }
 
 fn log_tls_routing_decision(
@@ -1193,6 +1324,7 @@ struct MitmInterceptCtx<'a> {
 #[derive(Clone, Copy)]
 struct MitmInterceptDeps<'a> {
     pinned_hosts: &'a host_store::PinnedHosts,
+    auto_pin_tracker: &'a auto_pin::AutoPinTracker,
     engine: &'a mitm::MitmEngine,
     metrics: &'a metrics::Metrics,
     policy_engine: &'a policy::PolicyEngine,
@@ -1242,6 +1374,9 @@ async fn run_mitm_intercept(
             Ok(())
         }
         Err(e) => {
+            if e.is_upstream_connect_failure() {
+                deps.metrics.inc_upstream_connect_failure_total();
+            }
             if e.is_benign_peer_close() {
                 deps.metrics.inc_mitm_success_total();
                 if let Some(store) = deps.receipts_store {
@@ -1273,40 +1408,8 @@ async fn run_mitm_intercept(
                     error = %e,
                     "upstream TLS failed, falling back to passthrough"
                 );
-                if deps
-                    .pinned_hosts
-                    .in_grace_period(Duration::from_secs(AUTO_PIN_GRACE_PERIOD_SECS))
-                {
-                    warn!(
-                        event = "host_auto_pin_suppressed",
-                        flow = ctx.flow,
-                        client_addr = %ctx.client_addr,
-                        host = ctx.host,
-                        target_addr = ctx.target_addr,
-                        pinned_hosts_file = %deps.pinned_hosts.path().display(),
-                        grace_period_secs = AUTO_PIN_GRACE_PERIOD_SECS,
-                        reason = "startup_grace_period",
-                        reject_type = "upstream_tls_reject",
-                        "suppressed auto-pin after upstream TLS rejection (startup grace period)"
-                    );
-                } else if pin_host_after_tls_rejection(deps.pinned_hosts, ctx.host)? {
-                    deps.metrics.inc_host_auto_pinned_total();
-                    if let Some(store) = deps.receipts_store {
-                        store.record_host_auto_pinned(ctx.host);
-                    }
-                    info!(
-                        event = "host_auto_pinned",
-                        flow = ctx.flow,
-                        client_addr = %ctx.client_addr,
-                        host = ctx.host,
-                        target_addr = ctx.target_addr,
-                        pinned_hosts_file = %deps.pinned_hosts.path().display(),
-                        reason = "upstream_tls_reject",
-                        "auto-pinned host after upstream TLS failure"
-                    );
-                }
+                observe_auto_pin_failure(ctx, deps, "upstream_tls_reject")?;
                 // Fall back to passthrough — browser's TLS goes directly to the real server
-                deps.metrics.inc_passthrough_tunnel_total();
                 tunnel(client_stream, ctx.target_addr, None, deps.metrics).await?;
                 return Ok(());
             }
@@ -1331,37 +1434,7 @@ async fn run_mitm_intercept(
                 if let Some(store) = deps.receipts_store {
                     store.record_client_tls_reject(ctx.host);
                 }
-                if deps
-                    .pinned_hosts
-                    .in_grace_period(Duration::from_secs(AUTO_PIN_GRACE_PERIOD_SECS))
-                {
-                    warn!(
-                        event = "host_auto_pin_suppressed",
-                        flow = ctx.flow,
-                        client_addr = %ctx.client_addr,
-                        host = ctx.host,
-                        target_addr = ctx.target_addr,
-                        pinned_hosts_file = %deps.pinned_hosts.path().display(),
-                        grace_period_secs = AUTO_PIN_GRACE_PERIOD_SECS,
-                        reason = "startup_grace_period",
-                        "suppressed auto-pin after client TLS rejection (startup grace period)"
-                    );
-                } else if pin_host_after_tls_rejection(deps.pinned_hosts, ctx.host)? {
-                    deps.metrics.inc_host_auto_pinned_total();
-                    if let Some(store) = deps.receipts_store {
-                        store.record_host_auto_pinned(ctx.host);
-                    }
-                    warn!(
-                        event = "host_auto_pinned",
-                        flow = ctx.flow,
-                        client_addr = %ctx.client_addr,
-                        host = ctx.host,
-                        target_addr = ctx.target_addr,
-                        pinned_hosts_file = %deps.pinned_hosts.path().display(),
-                        reason = "client_tls_reject",
-                        "added host to pinned list after TLS rejection"
-                    );
-                }
+                observe_auto_pin_failure(ctx, deps, "client_tls_reject")?;
             }
             Ok(())
         }
@@ -1371,7 +1444,7 @@ async fn run_mitm_intercept(
 async fn handle_http_proxy(
     client_stream: &mut TcpStream,
     client_addr: SocketAddr,
-    _metrics: &metrics::Metrics,
+    metrics: &metrics::Metrics,
 ) -> io::Result<()> {
     let (request_head, body_after_headers) = read_until_headers_complete(client_stream).await?;
 
@@ -1464,6 +1537,7 @@ async fn handle_http_proxy(
             Ok(())
         }
         Err(e) => {
+            metrics.inc_upstream_connect_failure_total();
             warn!(
                 event = "http_proxy_connect_failed",
                 client_addr = %client_addr,
@@ -1511,6 +1585,7 @@ async fn tunnel(
             Ok(())
         }
         Err(e) => {
+            metrics.inc_upstream_connect_failure_total();
             warn!("Failed to connect to target {}: {}", target_addr, e);
             Err(e)
         }
@@ -1723,7 +1798,7 @@ mod tests {
     #[test]
     fn decide_tls_routing_prefers_mitm_for_non_pinned_hosts() {
         assert_eq!(
-            decide_tls_routing(false, true),
+            decide_tls_routing(false, true, false),
             TlsRoutingDecision::AttemptMitm
         );
     }
@@ -1731,7 +1806,7 @@ mod tests {
     #[test]
     fn decide_tls_routing_prefers_passthrough_for_pinned_hosts() {
         assert_eq!(
-            decide_tls_routing(true, true),
+            decide_tls_routing(true, true, false),
             TlsRoutingDecision::Passthrough
         );
     }
@@ -1739,24 +1814,29 @@ mod tests {
     #[test]
     fn decide_tls_routing_passthrough_when_mitm_disabled() {
         assert_eq!(
-            decide_tls_routing(false, false),
+            decide_tls_routing(false, false, false),
             TlsRoutingDecision::Passthrough
         );
     }
 
     #[test]
     fn connect_mitm_is_skipped_when_early_tunnel_bytes_exist() {
-        assert!(!can_attempt_connect_mitm(false, true, true));
+        assert!(!can_attempt_connect_mitm(false, true, true, false));
     }
 
     #[test]
     fn connect_mitm_is_allowed_without_early_tunnel_bytes() {
-        assert!(can_attempt_connect_mitm(false, true, false));
+        assert!(can_attempt_connect_mitm(false, true, false, false));
     }
 
     #[test]
     fn connect_mitm_is_blocked_for_pinned_host() {
-        assert!(!can_attempt_connect_mitm(true, true, false));
+        assert!(!can_attempt_connect_mitm(true, true, false, false));
+    }
+
+    #[test]
+    fn connect_mitm_is_blocked_by_never_intercept_policy() {
+        assert!(!can_attempt_connect_mitm(false, true, false, true));
     }
 
     #[test]
@@ -1767,7 +1847,7 @@ mod tests {
 
         let initially_pinned = pinned_hosts.contains(host).expect("contains");
         assert_eq!(
-            decide_tls_routing(initially_pinned, true),
+            decide_tls_routing(initially_pinned, true, false),
             TlsRoutingDecision::AttemptMitm
         );
 
@@ -1779,7 +1859,7 @@ mod tests {
         let now_pinned = pinned_hosts.contains(host).expect("contains after pin");
         assert!(now_pinned);
         assert_eq!(
-            decide_tls_routing(now_pinned, true),
+            decide_tls_routing(now_pinned, true, false),
             TlsRoutingDecision::Passthrough
         );
 

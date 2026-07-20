@@ -1,6 +1,6 @@
 use crate::{dns_filter, host_store, metrics, policy, receipts};
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -25,6 +25,8 @@ struct DashboardState {
     pinned_hosts: Arc<host_store::PinnedHosts>,
     mitm_ca_export_cert_file: Option<PathBuf>,
     auto_pin_grace_period_secs: u64,
+    auto_pin_reject_threshold: u64,
+    auto_pin_reject_window_secs: u64,
     admin_token: String,
     start_time: SystemTime,
 }
@@ -34,6 +36,8 @@ pub struct DashboardOptions {
     pub doh_stats: Option<Arc<dns_filter::DohStats>>,
     pub mitm_ca_export_cert_file: Option<PathBuf>,
     pub auto_pin_grace_period_secs: u64,
+    pub auto_pin_reject_threshold: u64,
+    pub auto_pin_reject_window_secs: u64,
 }
 
 fn make_admin_token() -> String {
@@ -71,6 +75,8 @@ pub async fn run(
         pinned_hosts,
         mitm_ca_export_cert_file: options.mitm_ca_export_cert_file,
         auto_pin_grace_period_secs: options.auto_pin_grace_period_secs,
+        auto_pin_reject_threshold: options.auto_pin_reject_threshold,
+        auto_pin_reject_window_secs: options.auto_pin_reject_window_secs,
         admin_token: make_admin_token(),
         start_time: SystemTime::now(),
     });
@@ -97,7 +103,7 @@ pub async fn run(
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let state = Arc::clone(&state);
-                async move { handle_request(req, &state) }
+                async move { handle_request(req, &state).await }
             });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 // Connection reset / broken pipe is normal for browsers
@@ -110,10 +116,14 @@ pub async fn run(
     }
 }
 
-fn handle_request<B>(
+async fn handle_request<B>(
     req: Request<B>,
     state: &DashboardState,
-) -> Result<Response<Full<Bytes>>, hyper::http::Error> {
+) -> Result<Response<Full<Bytes>>, hyper::http::Error>
+where
+    B: hyper::body::Body + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => serve_html(),
         (&Method::GET, "/api/metrics") => serve_metrics(state),
@@ -122,13 +132,13 @@ fn handle_request<B>(
         (&Method::GET, "/api/status") => serve_status(state),
         (&Method::GET, "/download/ca.crt") => serve_ca_cert_pem(state),
         (&Method::POST, "/api/pins/reset") => serve_pins_reset(req.headers(), state),
+        (&Method::POST, "/api/pins/add") => serve_pins_add(req, state).await,
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(r#"{"error":"not_found"}"#))),
     }
 }
-
 fn json_response_with_status(
     status: StatusCode,
     value: serde_json::Value,
@@ -154,6 +164,8 @@ fn serve_metrics(state: &DashboardState) -> Result<Response<Full<Bytes>>, hyper:
     json_response(json!({
         "connection_total": s.connection_total,
         "passthrough_tunnel_total": s.passthrough_tunnel_total,
+        "never_intercept_bypass_total": s.never_intercept_bypass_total,
+        "upstream_connect_failure_total": s.upstream_connect_failure_total,
         "mitm_attempt_total": s.mitm_attempt_total,
         "mitm_success_total": s.mitm_success_total,
         "mitm_failure_total": s.mitm_failure_total,
@@ -259,6 +271,8 @@ fn serve_status(state: &DashboardState) -> Result<Response<Full<Bytes>>, hyper::
         "auto_pin_grace_active": grace_active,
         "auto_pin_grace_elapsed_secs": grace_elapsed_secs,
         "auto_pin_grace_remaining_secs": grace_remaining_secs,
+        "auto_pin_reject_threshold": state.auto_pin_reject_threshold,
+        "auto_pin_reject_window_secs": state.auto_pin_reject_window_secs,
         "mitm_ca_export_cert_file": ca_export_path,
         "mitm_ca_export_cert_exists": ca_export_exists,
         "doh_server_enabled": state.doh_stats.is_some(),
@@ -317,6 +331,100 @@ fn serve_pins_reset(
             )
         }
     }
+}
+
+async fn serve_pins_add<B>(
+    req: Request<B>,
+    state: &DashboardState,
+) -> Result<Response<Full<Bytes>>, hyper::http::Error>
+where
+    B: hyper::body::Body + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let token = req
+        .headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if token != state.admin_token {
+        return json_response_with_status(StatusCode::FORBIDDEN, json!({"error":"forbidden"}));
+    }
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            warn!(event = "pins_add_body_error", error = %e.into());
+            return json_response_with_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"body_read_failed"}),
+            );
+        }
+    };
+
+    let body_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return json_response_with_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json"}),
+            );
+        }
+    };
+
+    let mut hosts_to_add = Vec::new();
+    if let Some(h) = body_json.get("host").and_then(|v| v.as_str()) {
+        hosts_to_add.push(h.to_string());
+    } else if let Some(arr) = body_json.get("hosts").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(h) = v.as_str() {
+                hosts_to_add.push(h.to_string());
+            }
+        }
+    }
+
+    if hosts_to_add.is_empty() {
+        return json_response_with_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"missing_host_field"}),
+        );
+    }
+
+    let mut added = 0;
+    let mut already_present = 0;
+    for host in hosts_to_add {
+        let normalized = host.trim().to_lowercase();
+        if normalized.is_empty()
+            || normalized.contains(' ')
+            || normalized.contains('/')
+            || normalized.contains('*')
+        {
+            continue;
+        }
+
+        match state.pinned_hosts.add_and_persist(&normalized) {
+            Ok(true) => added += 1,
+            Ok(false) => already_present += 1,
+            Err(e) => {
+                warn!(event = "pins_add_persist_error", host = %normalized, error = %e);
+                return json_response_with_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error":"persistence_failed"}),
+                );
+            }
+        }
+    }
+
+    let total_count = state.pinned_hosts.len().unwrap_or(0);
+    info!(
+        event = "pins_add_succeeded",
+        added, already_present, total_count, "manual passthrough host update completed"
+    );
+    json_response(json!({
+        "ok": true,
+        "added": added,
+        "already_present": already_present,
+        "total_count": total_count
+    }))
 }
 
 fn serve_html() -> Result<Response<Full<Bytes>>, hyper::http::Error> {
@@ -442,6 +550,8 @@ footer{text-align:center;padding:2rem;font-size:.75rem;color:var(--dim)}
     </div>
     <div class="setup-actions">
       <a class="btn btn-primary btn-disabled" href="/download/ca.crt" download id="ca-download-btn">Download CA Cert</a>
+      <input type="text" id="add-pin-host" placeholder="domain.com" class="search-box" style="width: 200px; margin-right: 0.5rem;">
+      <button class="btn btn-primary" id="add-pin-btn" type="button" style="margin-right: 1.5rem;">Add Bypass</button>
       <button class="btn btn-danger" id="reset-pins-btn" type="button">Reset Pinned Hosts</button>
     </div>
   </section>
@@ -480,6 +590,7 @@ let lastDoh = {enabled:false, top_clients:[]};
 const CARDS = [
   {id:'connections', title:'Connections', accent:'', metrics:[
     ['connection_total','Total',true],['passthrough_tunnel_total','Passthrough'],
+    ['never_intercept_bypass_total','Local Bypass'],['upstream_connect_failure_total','Upstream Failures'],
     ['mitm_attempt_total','MITM Attempts'],['mitm_success_total','MITM Success'],
     ['mitm_failure_total','MITM Failures'],['host_auto_pinned_total','Auto-Pinned']]},
   {id:'dns', title:'DNS Filtering', accent:'green', metrics:[
@@ -648,6 +759,7 @@ $('#ca-accept-risk').addEventListener('change',e=>{
   if(e.target.checked){btn.classList.remove('btn-disabled');}
   else{btn.classList.add('btn-disabled');}
 });
+$('#add-pin-btn').addEventListener('click', async ()=>{  const host = $('#add-pin-host').value.trim();  if(!host){ alert('Enter a hostname'); return; }  if(!adminToken){ alert('Admin token unavailable yet; wait for status refresh.'); return; }  try{    const res = await fetch('/api/pins/add', {method:'POST', headers:{'x-admin-token': adminToken, 'Content-Type': 'application/json'}, body: JSON.stringify({host})});    const body = await res.json().catch(()=>({}));    if(!res.ok){ alert('Add pin failed: ' + (body.error || 'unknown error')); return; }    $('#add-pin-host').value = '';    alert(`Added ${host}. Total: ${body.total_count}`);    await refresh();  }catch(_){ alert('Add pin failed'); }});
 $('#reset-pins-btn').addEventListener('click', async ()=>{
   if(!adminToken){ alert('Admin token unavailable yet; wait for status refresh.'); return; }
   if(!confirm('Clear all pinned hosts? This cannot be undone.')) return;
@@ -705,6 +817,8 @@ mod tests {
             ),
             mitm_ca_export_cert_file: None,
             auto_pin_grace_period_secs: 60,
+            auto_pin_reject_threshold: 2,
+            auto_pin_reject_window_secs: 300,
             admin_token: "test-token".to_string(),
             start_time: SystemTime::now(),
         }
@@ -751,6 +865,8 @@ mod tests {
         assert!(v["uptime_secs"].as_u64().is_some());
         assert_eq!(v["policy_mode"], "Enforce");
         assert_eq!(v["auto_pin_grace_period_secs"], 60);
+        assert_eq!(v["auto_pin_reject_threshold"], 2);
+        assert_eq!(v["auto_pin_reject_window_secs"], 300);
         assert_eq!(v["doh_server_enabled"], false);
         assert!(v["admin_token"].as_str().is_some());
     }
@@ -777,6 +893,45 @@ mod tests {
         let resp = serve_pins_reset(&headers, &state).unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(state.pinned_hosts.len().expect("len after"), 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_pins_add_requires_token() {
+        let state = make_state();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pins/add")
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"host":"pinned.example"}"#)))
+            .expect("request");
+
+        let response = serve_pins_add(request, &state).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state.pinned_hosts.len().expect("len"), 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_pins_add_persists_normalized_host() {
+        let state = make_state();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pins/add")
+            .header("x-admin-token", "test-token")
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"host":"Pinned.Example."}"#)))
+            .expect("request");
+
+        let response = serve_pins_add(request, &state).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["added"], 1);
+        assert!(state
+            .pinned_hosts
+            .contains("pinned.example")
+            .expect("contains"));
     }
 
     #[tokio::test]

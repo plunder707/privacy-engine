@@ -14,6 +14,10 @@ pub struct EngineConfig {
     pub listen_host: String,
     pub listen_port: u16,
     pub pinned_hosts_file: PathBuf,
+    pub never_intercept_hosts: Vec<String>,
+    pub never_intercept_cidrs: Vec<String>,
+    pub auto_pin_reject_threshold: u64,
+    pub auto_pin_reject_window_secs: u64,
 
     pub enable_mitm: bool,
     pub mitm_ca_cert_file: PathBuf,
@@ -58,6 +62,10 @@ impl Default for EngineConfig {
             listen_host: "127.0.0.1".to_string(),
             listen_port: 8080,
             pinned_hosts_file: PathBuf::from("sni_pinned_hosts.json"),
+            never_intercept_hosts: Vec::new(),
+            never_intercept_cidrs: Vec::new(),
+            auto_pin_reject_threshold: 2,
+            auto_pin_reject_window_secs: 300,
 
             enable_mitm: false,
             mitm_ca_cert_file: PathBuf::from("mitm_ca_cert.pem"),
@@ -232,6 +240,10 @@ impl EngineConfig {
             "listen_host",
             "listen_port",
             "pinned_hosts_file",
+            "never_intercept_hosts",
+            "never_intercept_cidrs",
+            "auto_pin_reject_threshold",
+            "auto_pin_reject_window_secs",
             "enable_mitm",
             "mitm_ca_cert_file",
             "mitm_ca_key_file",
@@ -280,6 +292,30 @@ impl EngineConfig {
         }
         if let Some(v) = get_path_field(obj, "pinned_hosts_file")? {
             cfg.pinned_hosts_file = v;
+        }
+        if let Some(v) = get_string_array_field(obj, "never_intercept_hosts")? {
+            cfg.never_intercept_hosts = v;
+        }
+        if let Some(v) = get_string_array_field(obj, "never_intercept_cidrs")? {
+            cfg.never_intercept_cidrs = v;
+        }
+        if let Some(v) = get_u64_field(obj, "auto_pin_reject_threshold")? {
+            if v == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "auto_pin_reject_threshold must be at least 1",
+                ));
+            }
+            cfg.auto_pin_reject_threshold = v;
+        }
+        if let Some(v) = get_u64_field(obj, "auto_pin_reject_window_secs")? {
+            if v == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "auto_pin_reject_window_secs must be at least 1",
+                ));
+            }
+            cfg.auto_pin_reject_window_secs = v;
         }
 
         if let Some(v) = get_bool_field(obj, "enable_mitm")? {
@@ -450,6 +486,10 @@ mod tests {
             &path,
             r#"{
               "listen_port": 18081,
+              "never_intercept_hosts": ["service.internal"],
+              "never_intercept_cidrs": ["10.20.0.0/16"],
+              "auto_pin_reject_threshold": 3,
+              "auto_pin_reject_window_secs": 120,
               "enable_mitm": true,
               "tls_profile": "chrome",
               "enable_dns_filter": true,
@@ -463,6 +503,10 @@ mod tests {
         let cfg = EngineConfig::load_from_file(&path).expect("load");
         assert_eq!(cfg.listen_host, "127.0.0.1");
         assert_eq!(cfg.listen_port, 18081);
+        assert_eq!(cfg.never_intercept_hosts, ["service.internal"]);
+        assert_eq!(cfg.never_intercept_cidrs, ["10.20.0.0/16"]);
+        assert_eq!(cfg.auto_pin_reject_threshold, 3);
+        assert_eq!(cfg.auto_pin_reject_window_secs, 120);
         assert!(cfg.enable_mitm);
         assert_eq!(cfg.tls_profile, mitm::TlsProfile::Chrome);
         assert!(cfg.enable_dns_filter);
