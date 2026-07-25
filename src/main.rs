@@ -11,6 +11,7 @@ mod metrics;
 mod mitm;
 mod policy;
 mod receipts;
+mod request_stream;
 mod tls_parser;
 
 use clap::Parser;

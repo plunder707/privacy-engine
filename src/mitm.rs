@@ -533,6 +533,7 @@ where
     let mut first_response_filtered = false;
     let mut pending = Vec::new();
     let mut first_request_checked = false;
+    let mut request_stream = crate::request_stream::RequestStream::new();
 
     // Body rewriting state
     let mut buffering_body = false;
@@ -549,22 +550,45 @@ where
                 let n = res?;
                 if n == 0 {
                     client_closed = true;
+                    // Flush a partially buffered head so a client closing
+                    // mid-request cannot silently drop bytes.
+                    let tail = request_stream.take_pending();
+                    if !tail.is_empty() {
+                        upstream_write.write_all(&tail).await?;
+                        client_to_server_bytes += tail.len() as u64;
+                    }
                     upstream_write.shutdown().await?;
                 } else {
-                    // Check first request for WebSocket upgrade to tracker domains
+                    // Reassemble request heads across reads so inspection applies to
+                    // every request on a keep-alive connection, not only the first
+                    // read, and so binary bodies cannot suppress head rewriting.
+                    let (framed, head_len) = match request_stream.push(&client_buf[..n]) {
+                        crate::request_stream::Emit::Nothing => (Vec::new(), 0),
+                        crate::request_stream::Emit::Forward { bytes, head_len } => (bytes, head_len),
+                    };
+                    if framed.is_empty() {
+                        // Incomplete head still buffering; nothing to forward yet.
+                        continue;
+                    }
+                    let request_head = &framed[..head_len];
+                    let request_rest = &framed[head_len..];
+
+                    // Check each request for WebSocket upgrade to tracker domains
                     // and apply Referer header normalization for configured domains
-                    if !first_request_checked {
-                        first_request_checked = true;
+                    if head_len > 0 {
                         let plan = policy_engine.plan_for_host_with_source_ip(target_host, source_ip);
-                        if let Some(ref profile) = plan.user_profile_name {
-                            info!(
-                                event = "user_profile_applied",
-                                host = target_host,
-                                profile = %profile,
-                                "using user consent profile"
-                            );
+                        if !first_request_checked {
+                            first_request_checked = true;
+                            if let Some(ref profile) = plan.user_profile_name {
+                                info!(
+                                    event = "user_profile_applied",
+                                    host = target_host,
+                                    profile = %profile,
+                                    "using user consent profile"
+                                );
+                            }
                         }
-                        if plan.tracker_match && plan.websocket_blocking_enabled && request_has_websocket_upgrade(&client_buf[..n]) {
+                        if plan.tracker_match && plan.websocket_blocking_enabled && request_has_websocket_upgrade(request_head) {
                             info!(
                                 event = "websocket_blocked",
                                 host = target_host,
@@ -587,7 +611,7 @@ where
                         let mut outgoing: Option<Vec<u8>> = None;
 
                         if bw_plan.referer_spoof {
-                            if let Some(modified) = inject_google_referer(&client_buf[..n]) {
+                            if let Some(modified) = inject_google_referer(request_head) {
                                 info!(
                                     event = "referer_spoofed",
                                     host = target_host,
@@ -603,7 +627,7 @@ where
 
                         // Query parameter stripping
                         if bw_plan.query_param_strip {
-                            let src = outgoing.as_deref().unwrap_or(&client_buf[..n]);
+                            let src = outgoing.as_deref().unwrap_or(request_head);
                             if let Some(stripped) = strip_tracking_query_params(src) {
                                 info!(
                                     event = "query_params_stripped",
@@ -620,7 +644,7 @@ where
 
                         // Cache request header stripping for tracker domains
                         if plan.tracker_match {
-                            let src = outgoing.as_deref().unwrap_or(&client_buf[..n]);
+                            let src = outgoing.as_deref().unwrap_or(request_head);
                             if let Some(stripped) = strip_cache_request_headers(src) {
                                 info!(
                                     event = "cache_request_headers_stripped",
@@ -636,13 +660,16 @@ where
                         }
 
                         if let Some(modified) = outgoing {
-                            upstream_write.write_all(&modified).await?;
-                            client_to_server_bytes += modified.len() as u64;
+                            // Reattach any body bytes that arrived with the head.
+                            let mut combined = modified;
+                            combined.extend_from_slice(request_rest);
+                            upstream_write.write_all(&combined).await?;
+                            client_to_server_bytes += combined.len() as u64;
                             continue;
                         }
                     }
-                    upstream_write.write_all(&client_buf[..n]).await?;
-                    client_to_server_bytes += n as u64;
+                    upstream_write.write_all(&framed).await?;
+                    client_to_server_bytes += framed.len() as u64;
                 }
             }
             res = upstream_read.read(&mut upstream_buf), if !upstream_closed => {
