@@ -115,10 +115,7 @@ impl RequestStream {
                         // Refuse to buffer unbounded; forward what we have.
                         self.state = State::Passthrough;
                         let bytes = std::mem::take(&mut self.pending);
-                        return Emit::Forward {
-                            bytes,
-                            head_len: 0,
-                        };
+                        return Emit::Forward { bytes, head_len: 0 };
                     }
                     return Emit::Nothing;
                 };
@@ -196,7 +193,8 @@ fn body_framing(head: &[u8]) -> Framing {
         let name = &line[..colon];
         let value = trim_ascii(&line[colon + 1..]);
 
-        if name.eq_ignore_ascii_case(b"transfer-encoding") || name.eq_ignore_ascii_case(b"upgrade") {
+        if name.eq_ignore_ascii_case(b"transfer-encoding") || name.eq_ignore_ascii_case(b"upgrade")
+        {
             return Framing::Unknown;
         }
         if name.eq_ignore_ascii_case(b"content-length") {
@@ -285,7 +283,10 @@ mod tests {
         let head_len = req.len();
         req.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]); // invalid UTF-8
         let (bytes, got) = forward(s.push(&req));
-        assert_eq!(got, head_len, "head must be inspectable despite binary body");
+        assert_eq!(
+            got, head_len,
+            "head must be inspectable despite binary body"
+        );
         assert_eq!(bytes, req, "body bytes must survive untouched");
     }
 
@@ -319,7 +320,10 @@ mod tests {
         assert!(head_len > 0, "the chunked head itself is still inspectable");
         assert!(s.is_passthrough());
         let (bytes, later) = forward(s.push(b"5\r\nhello\r\n0\r\n\r\n"));
-        assert_eq!(bytes, b"5\r\nhello\r\n0\r\n\r\n", "chunk bytes forwarded verbatim");
+        assert_eq!(
+            bytes, b"5\r\nhello\r\n0\r\n\r\n",
+            "chunk bytes forwarded verbatim"
+        );
         assert_eq!(later, 0);
     }
 
@@ -328,7 +332,10 @@ mod tests {
         let mut s = RequestStream::new();
         let req = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n";
         forward(s.push(req));
-        assert!(s.is_passthrough(), "upgraded connections must not be reframed");
+        assert!(
+            s.is_passthrough(),
+            "upgraded connections must not be reframed"
+        );
     }
 
     #[test]

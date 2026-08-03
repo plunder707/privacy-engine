@@ -25,6 +25,9 @@ pub struct EngineConfig {
     pub mitm_ca_generate_if_missing: bool,
     pub mitm_ca_export_cert_file: Option<PathBuf>,
     pub tls_profile: mitm::TlsProfile,
+    /// Keep rewritable connections on HTTP/1.1 so the byte-oriented response
+    /// parser can enforce body policies. Disable to prefer HTTP/2 passthrough.
+    pub force_http1_for_filter_rewrite: bool,
 
     pub metrics_log_interval_secs: u64,
 
@@ -73,6 +76,7 @@ impl Default for EngineConfig {
             mitm_ca_generate_if_missing: true,
             mitm_ca_export_cert_file: None,
             tls_profile: mitm::TlsProfile::Default,
+            force_http1_for_filter_rewrite: true,
 
             metrics_log_interval_secs: 30,
 
@@ -250,6 +254,7 @@ impl EngineConfig {
             "mitm_ca_generate_if_missing",
             "mitm_ca_export_cert_file",
             "tls_profile",
+            "force_http1_for_filter_rewrite",
             "metrics_log_interval_secs",
             "policy_config_file",
             "policy_mode",
@@ -320,6 +325,9 @@ impl EngineConfig {
 
         if let Some(v) = get_bool_field(obj, "enable_mitm")? {
             cfg.enable_mitm = v;
+        }
+        if let Some(v) = get_bool_field(obj, "force_http1_for_filter_rewrite")? {
+            cfg.force_http1_for_filter_rewrite = v;
         }
         if let Some(v) = get_path_field(obj, "mitm_ca_cert_file")? {
             cfg.mitm_ca_cert_file = v;
@@ -492,6 +500,7 @@ mod tests {
               "auto_pin_reject_window_secs": 120,
               "enable_mitm": true,
               "tls_profile": "chrome",
+              "force_http1_for_filter_rewrite": false,
               "enable_dns_filter": true,
               "dns_upstream": "1.1.1.1:53",
               "filter_list_file": ["/tmp/easylist.txt"],
@@ -509,6 +518,7 @@ mod tests {
         assert_eq!(cfg.auto_pin_reject_window_secs, 120);
         assert!(cfg.enable_mitm);
         assert_eq!(cfg.tls_profile, mitm::TlsProfile::Chrome);
+        assert!(!cfg.force_http1_for_filter_rewrite);
         assert!(cfg.enable_dns_filter);
         assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
         assert_eq!(

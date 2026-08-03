@@ -176,6 +176,11 @@ fn serve_metrics(state: &DashboardState) -> Result<Response<Full<Bytes>>, hyper:
         "dns_report_only_total": s.dns_report_only_total,
         "body_rewrite_total": s.body_rewrite_total,
         "body_rewrite_skipped_total": s.body_rewrite_skipped_total,
+        "body_rewrite_bytes_injected_total": s.body_rewrite_bytes_injected_total,
+        "response_flush_completed_total": s.response_flush_completed_total,
+        "response_flush_failed_total": s.response_flush_failed_total,
+        "response_incomplete_total": s.response_incomplete_total,
+        "response_content_length_mismatch_total": s.response_content_length_mismatch_total,
         "filter_list_refresh_total": s.filter_list_refresh_total,
         "filter_list_refresh_failed_total": s.filter_list_refresh_failed_total,
         "filter_list_rules_active": s.filter_list_rules_active,
@@ -598,6 +603,11 @@ const CARDS = [
     ['dns_report_only_total','Report Only'],['dns_cname_uncloaked_total','CNAME Uncloaked']]},
   {id:'content', title:'Content Rewriting', accent:'blue', metrics:[
     ['body_rewrite_total','Rewrites',true],['body_rewrite_skipped_total','Skipped'],
+    ['body_rewrite_bytes_injected_total','Bytes Injected'],
+    ['response_flush_completed_total','Responses Flushed'],
+    ['response_flush_failed_total','Flush Failures'],
+    ['response_incomplete_total','Incomplete'],
+    ['response_content_length_mismatch_total','Length Mismatch'],
     ['filter_list_rules_active','Filter Rules Active']]},
   {id:'privacy', title:'Privacy Enforcement', accent:'cyan', metrics:[
     ['consent_enforcement_blocked_total','Consent Blocked',true],
@@ -689,6 +699,10 @@ const HOST_COLS = [
   ['websocket_blocked_total','WS Blk'],['referer_spoofed_total','Hdr Mod'],['cert_pin_violation_total','Pin Viol'],
   ['query_params_stripped_total','QP Strip'],['cache_headers_stripped_total','Cache Strip'],
   ['body_rewrite_total','Rewrites'],['body_rewrite_bytes_saved_total','Bytes Saved'],
+  ['body_rewrite_bytes_injected_total','Bytes Injected'],
+  ['response_flush_completed_total','Flushed'],['response_flush_failed_total','Flush Fail'],
+  ['response_incomplete_total','Incomplete'],
+  ['response_content_length_mismatch_total','CL Mismatch'],
   ['last_seen_unix','Last Seen']
 ];
 
@@ -733,7 +747,7 @@ function renderTable(hosts){
     for(const [key] of HOST_COLS){
       if(key==='host') html += `<td class="host-name">${esc(r.host)}</td>`;
       else if(key==='last_seen_unix') html += `<td>${fmtTime(r[key])}</td>`;
-      else if(key==='body_rewrite_bytes_saved_total') html += `<td>${fmtBytes(r[key]||0)}</td>`;
+      else if(key==='body_rewrite_bytes_saved_total'||key==='body_rewrite_bytes_injected_total') html += `<td>${fmtBytes(r[key]||0)}</td>`;
       else html += `<td>${(r[key]||0).toLocaleString()}</td>`;
     }
     html += '</tr>';
@@ -852,6 +866,11 @@ mod tests {
         assert_eq!(v["connection_total"], 1);
         assert_eq!(v["dns_blocked_total"], 1);
         assert_eq!(v["body_rewrite_total"], 0);
+        assert_eq!(v["body_rewrite_bytes_injected_total"], 0);
+        assert_eq!(v["response_flush_completed_total"], 0);
+        assert_eq!(v["response_flush_failed_total"], 0);
+        assert_eq!(v["response_incomplete_total"], 0);
+        assert_eq!(v["response_content_length_mismatch_total"], 0);
         assert_eq!(v["doh_query_total"], 0);
         assert_eq!(v["doh_unique_client_total"], 0);
     }

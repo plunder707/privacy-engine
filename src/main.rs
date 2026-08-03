@@ -145,6 +145,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = mitm::TlsProfile::Default)]
     tls_profile: mitm::TlsProfile,
 
+    /// Keep rewritable connections on HTTP/1.1. The body rewriter does not
+    /// parse HTTP/2 frames, so disabling this makes filter rewriting best-effort.
+    #[arg(long, default_value_t = true)]
+    force_http1_for_filter_rewrite: bool,
+
     /// Enable DNS pre-filter to block tracker domains at DNS level.
     #[arg(long, default_value_t = false)]
     enable_dns_filter: bool,
@@ -226,6 +231,7 @@ fn apply_engine_config(args: &mut Args, cfg: engine_config::EngineConfig) {
     args.mitm_ca_generate_if_missing = cfg.mitm_ca_generate_if_missing;
     args.mitm_ca_export_cert_file = cfg.mitm_ca_export_cert_file;
     args.tls_profile = cfg.tls_profile;
+    args.force_http1_for_filter_rewrite = cfg.force_http1_for_filter_rewrite;
 
     args.metrics_log_interval_secs = cfg.metrics_log_interval_secs;
 
@@ -601,8 +607,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        let engine = mitm::MitmEngine::new(Some(&ca_cfg), args.tls_profile, cert_log, cert_pin_db)
-            .map_err(io::Error::other)?;
+        let engine = mitm::MitmEngine::new(
+            Some(&ca_cfg),
+            args.tls_profile,
+            cert_log,
+            cert_pin_db,
+            args.force_http1_for_filter_rewrite,
+        )
+        .map_err(io::Error::other)?;
         match engine.ca_init_mode() {
             mitm::CaInitMode::LoadedFromFiles => {
                 info!(

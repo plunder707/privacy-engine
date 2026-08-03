@@ -234,6 +234,7 @@ pub struct MitmEngine {
     upstream_client_config_http1: Arc<ClientConfig>,
     cert_log: Option<Arc<CertLog>>,
     cert_pin_db: Option<Arc<crate::cert_pin::CertPinDb>>,
+    force_http1_for_filter_rewrite: bool,
 }
 
 impl MitmEngine {
@@ -242,6 +243,7 @@ impl MitmEngine {
         tls_profile: TlsProfile,
         cert_log: Option<Arc<CertLog>>,
         cert_pin_db: Option<Arc<crate::cert_pin::CertPinDb>>,
+        force_http1_for_filter_rewrite: bool,
     ) -> Result<Self, MitmError> {
         let (ca_cert, ca_key, ca_cert_pem_for_export, ca_init_mode) = match ca_files {
             Some(cfg) => load_or_create_ca(cfg)?,
@@ -280,6 +282,7 @@ impl MitmEngine {
             upstream_client_config_http1,
             cert_log,
             cert_pin_db,
+            force_http1_for_filter_rewrite,
         })
     }
 
@@ -310,9 +313,9 @@ impl MitmEngine {
         let manual_rewrite_active = body_rewrite_plan.strip_tracking_pixels
             || !body_rewrite_plan.manual_script_patterns.is_empty()
             || !body_rewrite_plan.manual_remove_selectors.is_empty();
-        // Only force HTTP/1.1 when we must (Set-Cookie policy) or when the user explicitly
-        // configured body rewriting rules. Filter-list-driven rewriting is best-effort.
-        let force_http1 = plan.enable_http1_set_cookie_filter || manual_rewrite_active;
+        let force_http1 = plan.enable_http1_set_cookie_filter
+            || manual_rewrite_active
+            || (self.force_http1_for_filter_rewrite && body_rewrite_plan.should_rewrite);
 
         // Probe upstream FIRST — if upstream TLS fails, we can fall back to passthrough
         // before touching the client's TLS handshake, so the browser never sees an error.
@@ -499,6 +502,90 @@ impl MitmEngine {
 
         Ok(server_config)
     }
+}
+
+async fn write_completed_response<W>(
+    client_write: &mut W,
+    headers: &[u8],
+    body: &[u8],
+    overflow: &[u8],
+    target_host: &str,
+    receipts_store: Option<&receipts::ReceiptStore>,
+    metrics: &metrics::Metrics,
+) -> io::Result<u64>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(advertised) = extract_content_length(headers) {
+        if advertised != body.len() {
+            metrics.inc_response_content_length_mismatch_total();
+            metrics.inc_response_incomplete_total();
+            if let Some(store) = receipts_store {
+                store.record_response_content_length_mismatch(target_host);
+                store.record_response_incomplete(target_host);
+            }
+            warn!(
+                event = "response_content_length_mismatch",
+                host = target_host,
+                advertised_body_bytes = advertised,
+                actual_body_bytes = body.len(),
+                "refusing to deliver response with inconsistent Content-Length"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed response Content-Length does not match body",
+            ));
+        }
+    }
+
+    let mut written = 0u64;
+    for segment in [headers, body, overflow] {
+        if let Err(error) = client_write.write_all(segment).await {
+            metrics.inc_response_incomplete_total();
+            if let Some(store) = receipts_store {
+                store.record_response_incomplete(target_host);
+            }
+            warn!(
+                event = "response_write_failed",
+                host = target_host,
+                response_bytes_written = written,
+                segment_bytes = segment.len(),
+                error = %error,
+                "completed response could not be written to client"
+            );
+            return Err(error);
+        }
+        written = written.saturating_add(u64::try_from(segment.len()).unwrap_or(u64::MAX));
+    }
+
+    if let Err(error) = client_write.flush().await {
+        metrics.inc_response_flush_failed_total();
+        metrics.inc_response_incomplete_total();
+        if let Some(store) = receipts_store {
+            store.record_response_flush_failed(target_host);
+            store.record_response_incomplete(target_host);
+        }
+        warn!(
+            event = "response_flush_failed",
+            host = target_host,
+            response_bytes = written,
+            error = %error,
+            "failed to flush completed response to client"
+        );
+        return Err(error);
+    }
+
+    metrics.inc_response_flush_completed_total();
+    if let Some(store) = receipts_store {
+        store.record_response_flush_completed(target_host);
+    }
+    info!(
+        event = "response_flush_completed",
+        host = target_host,
+        response_bytes = written,
+        "completed response crossed client flush boundary"
+    );
+    Ok(written)
 }
 
 async fn relay_with_first_response_header_policy<C, S>(
@@ -704,18 +791,26 @@ where
                                         ) {
                                             Some(rewritten) => {
                                                 headers = replace_chunked_with_content_length(&headers, rewritten.len());
-                                                client_write.write_all(&headers).await?;
-                                                client_write.write_all(&rewritten).await?;
-                                                server_to_client_bytes += (headers.len() + rewritten.len()) as u64;
-                                                if !overflow.is_empty() {
-                                                    client_write.write_all(overflow).await?;
-                                                    server_to_client_bytes += overflow.len() as u64;
-                                                }
+                                                server_to_client_bytes += write_completed_response(
+                                                    &mut client_write,
+                                                    &headers,
+                                                    &rewritten,
+                                                    overflow,
+                                                    target_host,
+                                                    receipts_store,
+                                                    metrics,
+                                                ).await?;
                                             }
                                             None => {
-                                                client_write.write_all(&headers).await?;
-                                                client_write.write_all(&body_buffer).await?;
-                                                server_to_client_bytes += (headers.len() + body_buffer.len()) as u64;
+                                                server_to_client_bytes += write_completed_response(
+                                                    &mut client_write,
+                                                    &headers,
+                                                    &body_buffer,
+                                                    &[],
+                                                    target_host,
+                                                    receipts_store,
+                                                    metrics,
+                                                ).await?;
                                         }
                                     }
                                 } else {
@@ -728,14 +823,26 @@ where
                                 match attempt_body_rewrite(&body_buffer, &plan, target_host, receipts_store, metrics, buffered_content_encoding.as_deref()) {
                                     Some(rewritten) => {
                                         headers = replace_content_length(&headers, rewritten.len());
-                                        client_write.write_all(&headers).await?;
-                                        client_write.write_all(&rewritten).await?;
-                                        server_to_client_bytes += (headers.len() + rewritten.len()) as u64;
+                                        server_to_client_bytes += write_completed_response(
+                                            &mut client_write,
+                                            &headers,
+                                            &rewritten,
+                                            &[],
+                                            target_host,
+                                            receipts_store,
+                                            metrics,
+                                        ).await?;
                                     }
                                     None => {
-                                        client_write.write_all(&headers).await?;
-                                        client_write.write_all(&body_buffer).await?;
-                                        server_to_client_bytes += (headers.len() + body_buffer.len()) as u64;
+                                        server_to_client_bytes += write_completed_response(
+                                            &mut client_write,
+                                            &headers,
+                                            &body_buffer,
+                                            &[],
+                                            target_host,
+                                            receipts_store,
+                                            metrics,
+                                        ).await?;
                                     }
                                 }
                             }
@@ -787,19 +894,27 @@ where
                             ) {
                                 Some(rewritten) => {
                                     headers = replace_chunked_with_content_length(&headers, rewritten.len());
-                                    client_write.write_all(&headers).await?;
-                                    client_write.write_all(&rewritten).await?;
-                                    server_to_client_bytes += (headers.len() + rewritten.len()) as u64;
-                                    if !overflow.is_empty() {
-                                        client_write.write_all(overflow).await?;
-                                        server_to_client_bytes += overflow.len() as u64;
-                                    }
+                                    server_to_client_bytes += write_completed_response(
+                                        &mut client_write,
+                                        &headers,
+                                        &rewritten,
+                                        overflow,
+                                        target_host,
+                                        receipts_store,
+                                        metrics,
+                                    ).await?;
                                 }
                                 None => {
                                     // report_only or error — send original chunked response
-                                    client_write.write_all(&headers).await?;
-                                client_write.write_all(&body_buffer).await?;
-                                server_to_client_bytes += (headers.len() + body_buffer.len()) as u64;
+                                    server_to_client_bytes += write_completed_response(
+                                        &mut client_write,
+                                        &headers,
+                                        &body_buffer,
+                                        &[],
+                                        target_host,
+                                        receipts_store,
+                                        metrics,
+                                    ).await?;
                             }
                         }
 
@@ -819,19 +934,29 @@ where
                         match attempt_body_rewrite(body, plan, target_host, receipts_store, metrics, buffered_content_encoding.as_deref()) {
                             Some(rewritten) => {
                                 headers = replace_content_length(&headers, rewritten.len());
-                                client_write.write_all(&headers).await?;
-                                client_write.write_all(&rewritten).await?;
-                                server_to_client_bytes += (headers.len() + rewritten.len()) as u64;
+                                let extra = overflow.unwrap_or(&[]);
+                                server_to_client_bytes += write_completed_response(
+                                    &mut client_write,
+                                    &headers,
+                                    &rewritten,
+                                    extra,
+                                    target_host,
+                                    receipts_store,
+                                    metrics,
+                                ).await?;
                             }
                             None => {
-                                client_write.write_all(&headers).await?;
-                                client_write.write_all(body).await?;
-                                server_to_client_bytes += (headers.len() + body.len()) as u64;
+                                let extra = overflow.unwrap_or(&[]);
+                                server_to_client_bytes += write_completed_response(
+                                    &mut client_write,
+                                    &headers,
+                                    body,
+                                    extra,
+                                    target_host,
+                                    receipts_store,
+                                    metrics,
+                                ).await?;
                             }
-                        }
-                        if let Some(extra) = overflow {
-                            client_write.write_all(extra).await?;
-                            server_to_client_bytes += extra.len() as u64;
                         }
 
                         body_rewrite_plan = None;
@@ -1101,6 +1226,9 @@ fn attempt_body_rewrite_with_codec(
                 metrics.inc_body_rewrite_total();
                 details.bytes_saved =
                     u64::try_from(body.len().saturating_sub(final_body.len())).unwrap_or(u64::MAX);
+                details.bytes_injected =
+                    u64::try_from(final_body.len().saturating_sub(body.len())).unwrap_or(u64::MAX);
+                metrics.add_body_rewrite_bytes_injected_total(details.bytes_injected);
                 if let Some(store) = receipts_store {
                     store.record_body_rewrite(target_host, mode_str, details);
                 }
@@ -1114,6 +1242,7 @@ fn attempt_body_rewrite_with_codec(
                     removed_pixels = details.removed_pixels,
                     removed_cosmetic = details.removed_cosmetic,
                     bytes_saved = details.bytes_saved,
+                    bytes_injected = details.bytes_injected,
                     "body rewrite applied"
                 );
                 Some(final_body)
@@ -1585,6 +1714,7 @@ fn rewrite_html_body(
             removed_pixels: removed_pixels.load(Ordering::Relaxed),
             removed_cosmetic: removed_cosmetic.load(Ordering::Relaxed),
             bytes_saved: 0,
+            bytes_injected: 0,
         },
     ))
 }
@@ -1861,11 +1991,248 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::ReadBuf;
+
+    struct FlushGatedIo {
+        read_data: Vec<u8>,
+        read_pos: usize,
+        pending_write: Vec<u8>,
+        delivered: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl FlushGatedIo {
+        fn new(read_data: Vec<u8>) -> (Self, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    read_data,
+                    read_pos: 0,
+                    pending_write: Vec::new(),
+                    delivered: Arc::clone(&delivered),
+                    flushes: Arc::clone(&flushes),
+                },
+                delivered,
+                flushes,
+            )
+        }
+    }
+
+    impl AsyncRead for FlushGatedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.read_pos >= self.read_data.len() {
+                return Poll::Pending;
+            }
+            let count = buf
+                .remaining()
+                .min(self.read_data.len().saturating_sub(self.read_pos));
+            let end = self.read_pos + count;
+            buf.put_slice(&self.read_data[self.read_pos..end]);
+            self.read_pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlushGatedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending_write.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let pending = std::mem::take(&mut self.pending_write);
+            self.delivered
+                .lock()
+                .expect("delivered lock")
+                .extend(pending);
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.as_mut().poll_flush(cx)
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailWriter;
+
+    impl AsyncWrite for FlushFailWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture flush failure",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_response_flush_failure_is_incomplete() {
+        let mut writer = FlushFailWriter;
+        let metrics = metrics::Metrics::default();
+        let error = write_completed_response(
+            &mut writer,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n",
+            b"x",
+            &[],
+            "fixture.invalid",
+            None,
+            &metrics,
+        )
+        .await
+        .expect_err("flush must fail");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.response_flush_completed_total, 0);
+        assert_eq!(snapshot.response_flush_failed_total, 1);
+        assert_eq!(snapshot.response_incomplete_total, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_response_rejects_content_length_mismatch() {
+        let (mut writer, delivered, flushes) = FlushGatedIo::new(Vec::new());
+        let metrics = metrics::Metrics::default();
+        let error = write_completed_response(
+            &mut writer,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n",
+            b"x",
+            &[],
+            "fixture.invalid",
+            None,
+            &metrics,
+        )
+        .await
+        .expect_err("mismatched framing must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(delivered.lock().expect("delivered lock").is_empty());
+        assert_eq!(flushes.load(Ordering::Relaxed), 0);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.response_content_length_mismatch_total, 1);
+        assert_eq!(snapshot.response_incomplete_total, 1);
+    }
+
+    async fn run_keep_alive_rewrite_fixture(
+        body_len: usize,
+        chunked: bool,
+    ) -> (Vec<u8>, metrics::MetricsSnapshot) {
+        let mut body = b"<html><head><title>fixture</title></head><body>".to_vec();
+        body.resize(body_len.saturating_sub(14), b'x');
+        body.extend_from_slice(b"</body></html>");
+
+        let response = if chunked {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:X}\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+            response
+        } else {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        };
+
+        let (mut client, delivered, flushes) = FlushGatedIo::new(
+            b"GET / HTTP/1.1\r\nHost: fixture.invalid\r\nConnection: keep-alive\r\n\r\n".to_vec(),
+        );
+        let (mut upstream, _, _) = FlushGatedIo::new(response);
+        let policy = policy::PolicyEngine::new(policy::PolicyMode::Enforce);
+        let filter_rules = crate::filter_list::FilterListRules {
+            cosmetic_selectors: Arc::new(vec![".fixture-ad".to_string()]),
+            ..Default::default()
+        };
+        policy.replace_filter_list_rules(filter_rules);
+        let metrics = metrics::Metrics::default();
+
+        let relay = relay_with_first_response_header_policy(
+            &mut client,
+            &mut upstream,
+            &policy,
+            "fixture.invalid",
+            None,
+            None,
+            &metrics,
+        );
+        tokio::pin!(relay);
+        tokio::select! {
+            result = &mut relay => panic!("keep-alive fixture terminated unexpectedly: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+
+        assert_eq!(
+            flushes.load(Ordering::Relaxed),
+            1,
+            "one completed response flush"
+        );
+        let bytes = delivered.lock().expect("delivered lock").clone();
+        (bytes, metrics.snapshot())
+    }
+
+    fn assert_complete_rewritten_response(response: &[u8]) {
+        let header_end = find_headers_end(response).expect("response headers");
+        let advertised = extract_content_length(&response[..header_end]).expect("content length");
+        assert_eq!(response.len() - header_end, advertised);
+        assert!(String::from_utf8_lossy(&response[header_end..]).contains("data-pe=\"1\""));
+    }
+
+    #[tokio::test]
+    async fn content_length_keep_alive_120k_flushes_complete_rewrite() {
+        let (response, snapshot) = run_keep_alive_rewrite_fixture(120_361, false).await;
+        assert_complete_rewritten_response(&response);
+        assert_eq!(snapshot.response_flush_completed_total, 1);
+        assert_eq!(snapshot.response_flush_failed_total, 0);
+        assert!(snapshot.body_rewrite_bytes_injected_total > 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_keep_alive_120k_flushes_complete_rewrite() {
+        let (response, snapshot) = run_keep_alive_rewrite_fixture(120_361, true).await;
+        assert_complete_rewritten_response(&response);
+        assert_eq!(snapshot.response_flush_completed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn content_length_keep_alive_600k_flushes_complete_rewrite() {
+        let (response, snapshot) = run_keep_alive_rewrite_fixture(600_000, false).await;
+        assert_complete_rewritten_response(&response);
+        assert_eq!(snapshot.response_flush_completed_total, 1);
+    }
 
     #[test]
     fn mitm_engine_builds_server_config_for_dns_host() {
-        let engine = MitmEngine::new(None, TlsProfile::Default, None, None).expect("new engine");
+        let engine =
+            MitmEngine::new(None, TlsProfile::Default, None, None, true).expect("new engine");
         let _cfg = engine
             .server_config_for_host("example.com", false)
             .expect("server config");
@@ -1873,7 +2240,8 @@ mod tests {
 
     #[test]
     fn server_config_alpn_differs_for_forced_http1() {
-        let engine = MitmEngine::new(None, TlsProfile::Default, None, None).expect("new engine");
+        let engine =
+            MitmEngine::new(None, TlsProfile::Default, None, None, true).expect("new engine");
         let h1 = engine
             .server_config_for_host("example.com", true)
             .expect("server config h1");
@@ -1909,7 +2277,7 @@ mod tests {
         };
 
         let engine_generated =
-            MitmEngine::new(Some(&cfg), TlsProfile::Default, None, None).expect("generated");
+            MitmEngine::new(Some(&cfg), TlsProfile::Default, None, None, true).expect("generated");
         assert_eq!(
             engine_generated.ca_init_mode(),
             CaInitMode::GeneratedAndPersisted
@@ -1918,14 +2286,14 @@ mod tests {
         assert!(key_path.exists());
 
         let engine_loaded =
-            MitmEngine::new(Some(&cfg), TlsProfile::Default, None, None).expect("loaded");
+            MitmEngine::new(Some(&cfg), TlsProfile::Default, None, None, true).expect("loaded");
         assert_eq!(engine_loaded.ca_init_mode(), CaInitMode::LoadedFromFiles);
     }
 
     #[test]
     fn mitm_engine_builds_with_chrome_profile() {
-        let engine =
-            MitmEngine::new(None, TlsProfile::Chrome, None, None).expect("new engine with chrome");
+        let engine = MitmEngine::new(None, TlsProfile::Chrome, None, None, true)
+            .expect("new engine with chrome");
         let _cfg = engine
             .server_config_for_host("example.com", false)
             .expect("server config");
@@ -2002,8 +2370,8 @@ mod tests {
             .as_nanos();
         let log_path = dir.join(format!("cert_log_test_{ts}.jsonl"));
         let cert_log = Arc::new(CertLog::open(&log_path).expect("open cert log"));
-        let engine =
-            MitmEngine::new(None, TlsProfile::Default, Some(cert_log), None).expect("new engine");
+        let engine = MitmEngine::new(None, TlsProfile::Default, Some(cert_log), None, true)
+            .expect("new engine");
         let _cfg = engine
             .server_config_for_host("example.com", false)
             .expect("server config");

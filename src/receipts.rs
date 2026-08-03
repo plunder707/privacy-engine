@@ -59,6 +59,11 @@ struct HostReceipt {
     body_rewrite_removed_pixel_total: u64,
     body_rewrite_removed_cosmetic_total: u64,
     body_rewrite_bytes_saved_total: u64,
+    body_rewrite_bytes_injected_total: u64,
+    response_flush_completed_total: u64,
+    response_flush_failed_total: u64,
+    response_incomplete_total: u64,
+    response_content_length_mismatch_total: u64,
 
     body_rewrite_removed_script_report_only_total: u64,
     body_rewrite_removed_pixel_report_only_total: u64,
@@ -125,6 +130,11 @@ impl HostReceipt {
             "body_rewrite_removed_pixel_total": self.body_rewrite_removed_pixel_total,
             "body_rewrite_removed_cosmetic_total": self.body_rewrite_removed_cosmetic_total,
             "body_rewrite_bytes_saved_total": self.body_rewrite_bytes_saved_total,
+            "body_rewrite_bytes_injected_total": self.body_rewrite_bytes_injected_total,
+            "response_flush_completed_total": self.response_flush_completed_total,
+            "response_flush_failed_total": self.response_flush_failed_total,
+            "response_incomplete_total": self.response_incomplete_total,
+            "response_content_length_mismatch_total": self.response_content_length_mismatch_total,
             "body_rewrite_removed_script_report_only_total": self.body_rewrite_removed_script_report_only_total,
             "body_rewrite_removed_pixel_report_only_total": self.body_rewrite_removed_pixel_report_only_total,
             "body_rewrite_removed_cosmetic_report_only_total": self.body_rewrite_removed_cosmetic_report_only_total,
@@ -179,6 +189,13 @@ impl HostReceipt {
             body_rewrite_removed_pixel_total: get_u64("body_rewrite_removed_pixel_total"),
             body_rewrite_removed_cosmetic_total: get_u64("body_rewrite_removed_cosmetic_total"),
             body_rewrite_bytes_saved_total: get_u64("body_rewrite_bytes_saved_total"),
+            body_rewrite_bytes_injected_total: get_u64("body_rewrite_bytes_injected_total"),
+            response_flush_completed_total: get_u64("response_flush_completed_total"),
+            response_flush_failed_total: get_u64("response_flush_failed_total"),
+            response_incomplete_total: get_u64("response_incomplete_total"),
+            response_content_length_mismatch_total: get_u64(
+                "response_content_length_mismatch_total",
+            ),
             body_rewrite_removed_script_report_only_total: get_u64(
                 "body_rewrite_removed_script_report_only_total",
             ),
@@ -1403,6 +1420,7 @@ pub struct BodyRewriteDetails {
     pub removed_pixels: u64,
     pub removed_cosmetic: u64,
     pub bytes_saved: u64,
+    pub bytes_injected: u64,
 }
 
 impl ReceiptStore {
@@ -1549,6 +1567,9 @@ impl ReceiptStore {
                 r.body_rewrite_bytes_saved_total = r
                     .body_rewrite_bytes_saved_total
                     .saturating_add(details.bytes_saved);
+                r.body_rewrite_bytes_injected_total = r
+                    .body_rewrite_bytes_injected_total
+                    .saturating_add(details.bytes_injected);
             }
             "report_only" => {
                 r.body_rewrite_report_only_total =
@@ -1573,6 +1594,31 @@ impl ReceiptStore {
     pub fn record_body_rewrite_skipped(&self, host: &str) {
         self.inc_counter(host, |r| {
             r.body_rewrite_skipped_total = r.body_rewrite_skipped_total.saturating_add(1)
+        });
+    }
+
+    pub fn record_response_flush_completed(&self, host: &str) {
+        self.inc_counter(host, |r| {
+            r.response_flush_completed_total = r.response_flush_completed_total.saturating_add(1)
+        });
+    }
+
+    pub fn record_response_flush_failed(&self, host: &str) {
+        self.inc_counter(host, |r| {
+            r.response_flush_failed_total = r.response_flush_failed_total.saturating_add(1)
+        });
+    }
+
+    pub fn record_response_incomplete(&self, host: &str) {
+        self.inc_counter(host, |r| {
+            r.response_incomplete_total = r.response_incomplete_total.saturating_add(1)
+        });
+    }
+
+    pub fn record_response_content_length_mismatch(&self, host: &str) {
+        self.inc_counter(host, |r| {
+            r.response_content_length_mismatch_total =
+                r.response_content_length_mismatch_total.saturating_add(1)
         });
     }
 
@@ -1715,6 +1761,18 @@ mod tests {
         let store = ReceiptStore::load(&path).expect("load");
         store.record_policy_set_cookie("doubleclick.net", "report_only", 2);
         store.record_policy_set_cookie("doubleclick.net", "enforce", 1);
+        store.record_body_rewrite(
+            "doubleclick.net",
+            "enforce",
+            BodyRewriteDetails {
+                bytes_injected: 1727,
+                ..Default::default()
+            },
+        );
+        store.record_response_flush_completed("doubleclick.net");
+        store.record_response_flush_failed("doubleclick.net");
+        store.record_response_incomplete("doubleclick.net");
+        store.record_response_content_length_mismatch("doubleclick.net");
         assert!(store.flush_if_dirty().expect("flush"));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1723,6 +1781,13 @@ mod tests {
         assert!(raw.contains("policy_set_cookie_would_strip_total"));
         assert!(raw.contains("policy_set_cookie_stripped_total"));
         assert!(raw.contains("policy_set_cookie_headers_total"));
+        let value: Value = serde_json::from_str(&raw).expect("parse receipts");
+        let host = &value["hosts"]["doubleclick.net"];
+        assert_eq!(host["body_rewrite_bytes_injected_total"], 1727);
+        assert_eq!(host["response_flush_completed_total"], 1);
+        assert_eq!(host["response_flush_failed_total"], 1);
+        assert_eq!(host["response_incomplete_total"], 1);
+        assert_eq!(host["response_content_length_mismatch_total"], 1);
     }
 
     #[tokio::test]

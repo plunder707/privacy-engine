@@ -202,7 +202,7 @@ cargo test
 cargo build --release
 ```
 
-203 tests, 0 failures. Tests cover: DNS parsing, NXDOMAIN building, CNAME chain inspection, filter list parsing (domain blocks, URL patterns, exceptions, cosmetic selectors), chunked TE decode/re-encode, gzip/deflate/brotli roundtrips, HTML rewriting, query param stripping, cache header stripping, referer injection, policy evaluation, consent enforcement, multi-user profiles, TOFU cert pinning, dashboard API endpoints, DoH stats, receipt persistence and pruning, host store grace period, TLS profile ordering.
+227 tests, 0 failures. Tests cover: DNS parsing, NXDOMAIN building, CNAME chain inspection, filter list parsing (domain blocks, URL patterns, exceptions, cosmetic selectors), chunked TE decode/re-encode, gzip/deflate/brotli roundtrips, HTML rewriting, keep-alive response completion, framing invariants, and flush failures, query param stripping, cache header stripping, referer injection, policy evaluation, consent enforcement, multi-user profiles, TOFU cert pinning, dashboard API endpoints, DoH stats, receipt persistence and pruning, host store grace period, TLS profile ordering.
 
 ## Customization
 

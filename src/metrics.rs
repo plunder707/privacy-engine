@@ -17,6 +17,11 @@ pub struct Metrics {
     dns_report_only_total: AtomicU64,
     body_rewrite_total: AtomicU64,
     body_rewrite_skipped_total: AtomicU64,
+    body_rewrite_bytes_injected_total: AtomicU64,
+    response_flush_completed_total: AtomicU64,
+    response_flush_failed_total: AtomicU64,
+    response_incomplete_total: AtomicU64,
+    response_content_length_mismatch_total: AtomicU64,
     filter_list_refresh_total: AtomicU64,
     filter_list_refresh_failed_total: AtomicU64,
     filter_list_rules_active: AtomicU64,
@@ -45,6 +50,11 @@ pub struct MetricsSnapshot {
     pub dns_report_only_total: u64,
     pub body_rewrite_total: u64,
     pub body_rewrite_skipped_total: u64,
+    pub body_rewrite_bytes_injected_total: u64,
+    pub response_flush_completed_total: u64,
+    pub response_flush_failed_total: u64,
+    pub response_incomplete_total: u64,
+    pub response_content_length_mismatch_total: u64,
     pub filter_list_refresh_total: u64,
     pub filter_list_refresh_failed_total: u64,
     pub filter_list_rules_active: u64,
@@ -119,6 +129,31 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_body_rewrite_bytes_injected_total(&self, bytes: u64) {
+        self.body_rewrite_bytes_injected_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn inc_response_flush_completed_total(&self) {
+        self.response_flush_completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_response_flush_failed_total(&self) {
+        self.response_flush_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_response_incomplete_total(&self) {
+        self.response_incomplete_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_response_content_length_mismatch_total(&self) {
+        self.response_content_length_mismatch_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_filter_list_refresh_total(&self) {
         self.filter_list_refresh_total
             .fetch_add(1, Ordering::Relaxed);
@@ -184,6 +219,17 @@ impl Metrics {
             dns_report_only_total: self.dns_report_only_total.load(Ordering::Relaxed),
             body_rewrite_total: self.body_rewrite_total.load(Ordering::Relaxed),
             body_rewrite_skipped_total: self.body_rewrite_skipped_total.load(Ordering::Relaxed),
+            body_rewrite_bytes_injected_total: self
+                .body_rewrite_bytes_injected_total
+                .load(Ordering::Relaxed),
+            response_flush_completed_total: self
+                .response_flush_completed_total
+                .load(Ordering::Relaxed),
+            response_flush_failed_total: self.response_flush_failed_total.load(Ordering::Relaxed),
+            response_incomplete_total: self.response_incomplete_total.load(Ordering::Relaxed),
+            response_content_length_mismatch_total: self
+                .response_content_length_mismatch_total
+                .load(Ordering::Relaxed),
             filter_list_refresh_total: self.filter_list_refresh_total.load(Ordering::Relaxed),
             filter_list_refresh_failed_total: self
                 .filter_list_refresh_failed_total
@@ -220,6 +266,11 @@ impl Metrics {
             dns_report_only_total = s.dns_report_only_total,
             body_rewrite_total = s.body_rewrite_total,
             body_rewrite_skipped_total = s.body_rewrite_skipped_total,
+            body_rewrite_bytes_injected_total = s.body_rewrite_bytes_injected_total,
+            response_flush_completed_total = s.response_flush_completed_total,
+            response_flush_failed_total = s.response_flush_failed_total,
+            response_incomplete_total = s.response_incomplete_total,
+            response_content_length_mismatch_total = s.response_content_length_mismatch_total,
             filter_list_refresh_total = s.filter_list_refresh_total,
             filter_list_refresh_failed_total = s.filter_list_refresh_failed_total,
             filter_list_rules_active = s.filter_list_rules_active,
@@ -256,6 +307,11 @@ mod tests {
         m.inc_dns_report_only_total();
         m.inc_body_rewrite_total();
         m.inc_body_rewrite_skipped_total();
+        m.add_body_rewrite_bytes_injected_total(1727);
+        m.inc_response_flush_completed_total();
+        m.inc_response_flush_failed_total();
+        m.inc_response_incomplete_total();
+        m.inc_response_content_length_mismatch_total();
         m.inc_filter_list_refresh_total();
         m.inc_filter_list_refresh_failed_total();
         m.set_filter_list_rules_active(42);
@@ -282,6 +338,11 @@ mod tests {
         assert_eq!(s.dns_report_only_total, 1);
         assert_eq!(s.body_rewrite_total, 1);
         assert_eq!(s.body_rewrite_skipped_total, 1);
+        assert_eq!(s.body_rewrite_bytes_injected_total, 1727);
+        assert_eq!(s.response_flush_completed_total, 1);
+        assert_eq!(s.response_flush_failed_total, 1);
+        assert_eq!(s.response_incomplete_total, 1);
+        assert_eq!(s.response_content_length_mismatch_total, 1);
         assert_eq!(s.filter_list_refresh_total, 1);
         assert_eq!(s.filter_list_refresh_failed_total, 1);
         assert_eq!(s.filter_list_rules_active, 42);

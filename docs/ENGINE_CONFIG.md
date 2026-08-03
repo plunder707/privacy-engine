@@ -34,6 +34,7 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 - `mitm_ca_generate_if_missing` (bool)
 - `mitm_ca_export_cert_file` (string path or `null`)
 - `tls_profile` (`"default"` or `"chrome"`)
+- `force_http1_for_filter_rewrite` (bool, default `true`; required for the HTTP/1.1 body rewriter, disable to prefer HTTP/2 passthrough)
 
 - `metrics_log_interval_secs` (number)
 
@@ -48,6 +49,7 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 - `dns_listen_host` (string)
 - `dns_listen_port` (number)
 - `dns_upstream` (string, e.g. `"1.1.1.1:53"`)
+- `dns_upstream_doh` (DoH URL string or `null`)
 
 - `filter_list_file` (array of string paths)
 - `filter_list_url` (array of strings)
@@ -57,6 +59,7 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 
 - `dashboard_port` (number or `null`)
 - `cert_log_file` (string path or `null`)
+- `cert_pin_file` (string path or `null`)
 
 ## Example
 
@@ -76,6 +79,10 @@ Operational note:
   managed CA bundle and environment variables, so Python virtual environments
   inherit trust without modifying each environment's `certifi` package.
 - The dashboard now includes setup actions (`/download/ca.crt`, pinned-host reset button).
+- Rewritten responses are not considered complete until their full framed body
+  crosses an explicit client flush boundary. The dashboard exposes completed
+  flushes, flush failures, incomplete responses, and injected bytes separately
+  from rewrite-attempt counters.
 - Auto-pin is suppressed during a fixed 60-second startup grace period. After
   that, a host must reach `auto_pin_reject_threshold` TLS failures inside
   `auto_pin_reject_window_secs`; the first observation is logged/receipted as
