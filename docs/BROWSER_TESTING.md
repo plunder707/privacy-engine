@@ -14,8 +14,7 @@ Recommended (config-first; avoids long flag lists):
 
 ```bash
 cd ~/workspace/privacy-engine-rust
-cargo build --release
-RUST_LOG=info ./target/release/privacy-engine-rust --engine-config configs/basic.local.json
+./scripts/pe-restart.sh configs/easylist.local.json
 ```
 
 Equivalent explicit flags (useful for debugging):
@@ -79,7 +78,7 @@ Practical checks:
 
 ## 6) Validate DNS Pre-Filter (If Enabled)
 
-The DNS filter is a separate UDP listener (`--enable-dns-filter`, default port `5353`). Browser testing depends on your OS DNS settings, so the simplest validation is via `dig`:
+The DNS filter is a separate UDP listener. Browser proxying does not automatically route system DNS through it, so validate the listener directly before changing OS DNS:
 
 ```bash
 dig @127.0.0.1 -p 5353 doubleclick.net A +short
@@ -90,6 +89,11 @@ Pass criteria:
 
 - Blocked tracker domains return empty / NXDOMAIN behavior.
 - Normal domains resolve normally.
+- `/api/metrics` shows completed DNS responses and no unexplained upstream failures.
+
+For mirrored WSL, Windows resolver ownership, NordVPN, and Tailscale behavior,
+use [`WINDOWS_WSL_NETWORKING.md`](WINDOWS_WSL_NETWORKING.md). Do not replace
+`/etc/resolv.conf` until the direct DNS canary passes.
 
 ## 7) Validate Receipts + Compliance + Dashboard
 

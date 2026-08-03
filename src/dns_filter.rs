@@ -6,11 +6,12 @@ use bytes::Bytes;
 use hickory_proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::RData;
 use hickory_proto::serialize::binary::BinDecodable;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::client::conn::http1 as client_http1;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -21,15 +22,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 const MAX_DNS_PACKET: usize = 4096;
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const DOH_CLIENT_STALE_SECS: u64 = 24 * 60 * 60;
 const DOH_SNAPSHOT_TOP_CLIENTS: usize = 20;
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DohFailureMode {
+    FailClosed,
+    FallbackUdp,
+}
+
+impl DohFailureMode {
+    pub fn parse_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_closed" | "fail-closed" => Some(Self::FailClosed),
+            "fallback_udp" | "fallback-udp" => Some(Self::FallbackUdp),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DohClientSnapshot {
@@ -155,48 +173,166 @@ async fn doh_query(url: &str, query_data: &[u8]) -> io::Result<Vec<u8>> {
     let path = uri
         .path_and_query()
         .map(|p| p.as_str())
-        .unwrap_or("/dns-query");
+        .unwrap_or("/dns-query")
+        .to_string();
 
     let tcp = TcpStream::connect((host, port)).await?;
     let tls_cfg = make_tls_client_config()?;
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid DNS name"))?;
     let connector = TlsConnector::from(tls_cfg);
-    let mut stream = connector
+    let stream = connector
         .connect(server_name, tcp)
         .await
         .map_err(|e| io::Error::other(format!("DoH TLS handshake failed: {e}")))?;
 
-    let content_length = query_data.len();
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         User-Agent: privacy-engine-rust/0.1\r\n\
-         Content-Type: application/dns-message\r\n\
-         Content-Length: {content_length}\r\n\
-         Accept: application/dns-message\r\n\
-         \r\n"
-    );
+    doh_request_over_io(stream, host, &path, query_data).await
+}
 
-    stream.write_all(req.as_bytes()).await?;
-    stream.write_all(query_data).await?;
-    stream.flush().await?;
+async fn doh_request_over_io<T>(
+    stream: T,
+    host: &str,
+    path: &str,
+    query_data: &[u8],
+) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = client_http1::handshake(io)
+        .await
+        .map_err(|e| io::Error::other(format!("DoH HTTP handshake failed: {e}")))?;
+    let driver = tokio::spawn(connection);
 
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    let result = async {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(hyper::header::HOST, host)
+            .header(hyper::header::USER_AGENT, "privacy-engine-rust/0.1")
+            .header(hyper::header::CONTENT_TYPE, "application/dns-message")
+            .header(hyper::header::ACCEPT, "application/dns-message")
+            .body(Full::new(Bytes::copy_from_slice(query_data)))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    // Simple HTTP parser to find body
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP response"))?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| io::Error::other(format!("DoH request failed: {e}")))?;
+        if response.status() != StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "DoH upstream returned HTTP {}",
+                response.status()
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("DoH upstream returned invalid content type '{content_type}'"),
+            ));
+        }
 
-    // We could parse Content-Length, but read_to_end handles the whole body if connection closes or we trust the server.
-    // For proper HTTP/1.1 keep-alive we should parse CL. But standard DoH often closes or we can just grab body.
-    // Let's just grab the body after headers.
-    let body = buf.split_off(header_end + 4);
+        let body = Limited::new(response.into_body(), MAX_DNS_PACKET)
+            .collect()
+            .await
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid DoH body: {e}"))
+            })?
+            .to_bytes()
+            .to_vec();
+        let expected = QueryKey::from_query_bytes(query_data).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid outbound DNS query")
+        })?;
+        if !expected.matches_reply_bytes(&body) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DoH response does not match the outbound DNS query",
+            ));
+        }
+        Ok(body)
+    }
+    .await;
 
+    driver.abort();
+    result
+}
+
+async fn udp_query(upstream_addr: SocketAddr, query_data: &[u8]) -> io::Result<Vec<u8>> {
+    let upstream_bind = if upstream_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(upstream_bind).await?;
+    socket.connect(upstream_addr).await?;
+    socket.send(query_data).await?;
+    let mut reply = [0u8; MAX_DNS_PACKET];
+    let len = tokio::time::timeout(UPSTREAM_TIMEOUT, socket.recv(&mut reply))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP DNS upstream timed out"))??;
+    let body = reply[..len].to_vec();
+    let expected = QueryKey::from_query_bytes(query_data)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid outbound DNS query"))?;
+    if !expected.matches_reply_bytes(&body) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UDP response does not match the outbound DNS query",
+        ));
+    }
     Ok(body)
+}
+
+async fn query_upstream(
+    query_data: &[u8],
+    upstream_addr: SocketAddr,
+    upstream_doh: Option<&str>,
+    failure_mode: DohFailureMode,
+    metrics: &metrics::Metrics,
+) -> io::Result<Vec<u8>> {
+    if let Some(url) = upstream_doh {
+        metrics.inc_dns_doh_query_total();
+        let result = tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(url, query_data)).await;
+        match result {
+            Ok(Ok(reply)) => {
+                metrics.inc_dns_response_completed_total();
+                return Ok(reply);
+            }
+            Ok(Err(error)) => {
+                metrics.inc_dns_doh_failure_total();
+                warn!(event = "dns_doh_upstream_error", url, error = %error);
+            }
+            Err(_) => {
+                metrics.inc_dns_doh_failure_total();
+                warn!(event = "dns_doh_upstream_timeout", url);
+            }
+        }
+
+        if failure_mode == DohFailureMode::FailClosed {
+            metrics.inc_dns_upstream_failure_total();
+            return Err(io::Error::other("DoH failed and fallback is disabled"));
+        }
+        metrics.inc_dns_udp_fallback_total();
+    }
+
+    match udp_query(upstream_addr, query_data).await {
+        Ok(reply) => {
+            metrics.inc_dns_response_completed_total();
+            Ok(reply)
+        }
+        Err(error) => {
+            metrics.inc_dns_upstream_failure_total();
+            Err(error)
+        }
+    }
 }
 
 fn process_dns_query(
@@ -271,6 +407,8 @@ pub struct DnsFilterConfig {
     pub listen_addr: SocketAddr,
     pub upstream_addr: SocketAddr,
     pub upstream_doh: Option<String>,
+    pub doh_failure_mode: DohFailureMode,
+    pub max_inflight: usize,
     pub policy_engine: Arc<policy::PolicyEngine>,
     pub metrics: Arc<metrics::Metrics>,
     pub receipts_store: Option<Arc<receipts::ReceiptStore>>,
@@ -298,34 +436,8 @@ pub async fn run_dns_filter(config: DnsFilterConfig) {
         }
     };
 
-    // Reuse a single upstream socket to avoid per-query bind overhead and ephemeral port churn.
-    let upstream_bind = if config.upstream_addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let upstream_socket = match UdpSocket::bind(upstream_bind).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                event = "dns_upstream_bind_failed",
-                bind_addr = upstream_bind,
-                error = %e,
-                "failed to bind upstream DNS socket"
-            );
-            return;
-        }
-    };
-    if let Err(e) = upstream_socket.connect(config.upstream_addr).await {
-        warn!(
-            event = "dns_upstream_connect_failed",
-            upstream_addr = %config.upstream_addr,
-            error = %e,
-            "failed to connect upstream DNS socket"
-        );
-        return;
-    }
-
+    let socket = Arc::new(socket);
+    let upstream_slots = Arc::new(Semaphore::new(config.max_inflight.max(1)));
     let mut buf = [0u8; MAX_DNS_PACKET];
     loop {
         let (len, client_addr) = match socket.recv_from(&mut buf).await {
@@ -357,22 +469,47 @@ pub async fn run_dns_filter(config: DnsFilterConfig) {
             }
         }
 
-        let cname_ctx = CnameCheckContext {
-            policy_engine: &config.policy_engine,
-            metrics: &config.metrics,
-            receipts_store: config.receipts_store.as_deref(),
-            query_name: &query_name,
+        let permit = match upstream_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                config.metrics.inc_dns_query_saturated_total();
+                warn!(
+                    event = "dns_query_saturated",
+                    client = %client_addr,
+                    max_inflight = config.max_inflight,
+                    "DNS upstream concurrency limit reached"
+                );
+                continue;
+            }
         };
 
-        forward_and_reply(
-            &socket,
-            query_data,
-            &upstream_socket,
-            config.upstream_doh.as_deref(),
-            client_addr,
-            Some(&cname_ctx),
-        )
-        .await;
+        let listener = Arc::clone(&socket);
+        let query = query_data.to_vec();
+        let upstream_addr = config.upstream_addr;
+        let upstream_doh = config.upstream_doh.clone();
+        let failure_mode = config.doh_failure_mode;
+        let policy_engine = Arc::clone(&config.policy_engine);
+        let metrics = Arc::clone(&config.metrics);
+        let receipts_store = config.receipts_store.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let cname_ctx = CnameCheckContext {
+                policy_engine: &policy_engine,
+                metrics: &metrics,
+                receipts_store: receipts_store.as_deref(),
+                query_name: &query_name,
+            };
+            forward_and_reply(
+                &listener,
+                &query,
+                upstream_addr,
+                upstream_doh.as_deref(),
+                failure_mode,
+                client_addr,
+                Some(&cname_ctx),
+            )
+            .await;
+        });
     }
 }
 
@@ -382,6 +519,7 @@ pub struct DohServerConfig {
     pub key: PrivateKeyDer<'static>,
     pub upstream_addr: SocketAddr,
     pub upstream_doh: Option<String>,
+    pub doh_failure_mode: DohFailureMode,
     pub stats: Arc<DohStats>,
     pub policy_engine: Arc<policy::PolicyEngine>,
     pub metrics: Arc<metrics::Metrics>,
@@ -396,6 +534,7 @@ impl Clone for DohServerConfig {
             key: self.key.clone_key(),
             upstream_addr: self.upstream_addr,
             upstream_doh: self.upstream_doh.clone(),
+            doh_failure_mode: self.doh_failure_mode,
             stats: self.stats.clone(),
             policy_engine: self.policy_engine.clone(),
             metrics: self.metrics.clone(),
@@ -526,54 +665,15 @@ async fn handle_doh_request(
     // Note: Reusing UDP forward_and_reply requires a dummy listener socket which we don't want to bind per request.
     // Instead we reimplement basic forwarding logic here since we need to return HTTP response, not send to UDP socket.
 
-    let reply_bytes: Option<Vec<u8>> = if let Some(doh_url) = &config.upstream_doh {
-        match tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(doh_url, &query_bytes)).await {
-            Ok(Ok(data)) => Some(data),
-            Ok(Err(e)) => {
-                warn!(event = "doh_server_upstream_doh_error", error = %e);
-                None
-            }
-            Err(_) => {
-                warn!(event = "doh_server_upstream_timeout");
-                None
-            }
-        }
-    } else {
-        // UDP forwarding.
-        // Use a per-request socket to avoid reply races across concurrent DoH requests.
-        let upstream_bind = if config.upstream_addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let upstream_socket = match UdpSocket::bind(upstream_bind).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(event = "doh_server_upstream_bind_error", error = %e);
-                return Ok(doh_text_response(StatusCode::BAD_GATEWAY, "Upstream Error"));
-            }
-        };
-        if let Err(e) = upstream_socket.connect(config.upstream_addr).await {
-            warn!(event = "doh_server_upstream_connect_error", error = %e);
-            return Ok(doh_text_response(StatusCode::BAD_GATEWAY, "Upstream Error"));
-        }
-        if let Err(e) = upstream_socket.send(&query_bytes).await {
-            warn!(event = "doh_server_udp_send_error", error = %e);
-            return Ok(doh_text_response(StatusCode::BAD_GATEWAY, "Upstream Error"));
-        }
-        let mut buf = [0u8; MAX_DNS_PACKET];
-        match tokio::time::timeout(UPSTREAM_TIMEOUT, upstream_socket.recv(&mut buf)).await {
-            Ok(Ok(len)) => Some(buf[..len].to_vec()),
-            Ok(Err(e)) => {
-                warn!(event = "doh_server_udp_recv_error", error = %e);
-                None
-            }
-            Err(_) => {
-                warn!(event = "doh_server_upstream_timeout");
-                None
-            }
-        }
-    };
+    let reply_bytes = query_upstream(
+        &query_bytes,
+        config.upstream_addr,
+        config.upstream_doh.as_deref(),
+        config.doh_failure_mode,
+        &config.metrics,
+    )
+    .await
+    .ok();
 
     if let Some(reply) = reply_bytes {
         // CNAME uncloaking check (simplified context)
@@ -691,72 +791,24 @@ fn extract_cname_targets(response_bytes: &[u8]) -> Vec<String> {
 async fn forward_and_reply(
     listener: &UdpSocket,
     query: &[u8],
-    upstream_socket: &UdpSocket,
+    upstream_addr: SocketAddr,
     doh_url: Option<&str>,
+    failure_mode: DohFailureMode,
     client: SocketAddr,
     cname_ctx: Option<&CnameCheckContext<'_>>,
 ) {
-    let expected = QueryKey::from_query_bytes(query);
-
-    let reply_data: Option<Vec<u8>> = if let Some(url) = doh_url {
-        match tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(url, query)).await {
-            Ok(Ok(data)) => Some(data),
-            Ok(Err(e)) => {
-                warn!(event = "doh_query_error", url = url, error = %e, "DoH query failed");
-                None
-            }
-            Err(_) => {
-                warn!(
-                    event = "doh_query_timeout",
-                    url = url,
-                    "DoH query timed out"
-                );
-                None
-            }
-        }
-    } else {
-        // UDP Fallback / Standard Path
-        if let Err(e) = upstream_socket.send(query).await {
-            warn!(
-                event = "dns_forward_send_error",
-                error = %e,
-                "failed to send to upstream DNS"
-            );
-            return;
-        }
-
-        let mut reply_buf = [0u8; MAX_DNS_PACKET];
-        match tokio::time::timeout(UPSTREAM_TIMEOUT, upstream_socket.recv(&mut reply_buf)).await {
-            Ok(Ok(len)) => Some(reply_buf[..len].to_vec()),
-            Ok(Err(e)) => {
-                warn!(
-                    event = "dns_upstream_recv_error",
-                    error = %e,
-                    "failed to receive from upstream DNS"
-                );
-                return;
-            }
-            Err(_) => {
-                warn!(event = "dns_upstream_timeout", "upstream DNS timed out");
-                return;
-            }
-        }
+    let Some(metrics) = cname_ctx.map(|ctx| ctx.metrics) else {
+        warn!(
+            event = "dns_missing_metrics",
+            "cannot forward DNS query without metrics"
+        );
+        return;
     };
+    let reply_data = query_upstream(query, upstream_addr, doh_url, failure_mode, metrics)
+        .await
+        .ok();
 
     if let Some(ref reply_bytes) = reply_data {
-        if let Some(ref key) = expected {
-            if !key.matches_reply_bytes(reply_bytes) {
-                warn!(
-                    event = "dns_upstream_reply_mismatch",
-                    expected_id = key.id,
-                    expected_name = %key.name,
-                    expected_type = ?key.qtype,
-                    "ignoring mismatched upstream DNS reply"
-                );
-                return;
-            }
-        }
-
         if let Some(ctx) = cname_ctx {
             let targets = extract_cname_targets(reply_bytes);
             for target in &targets {
@@ -830,6 +882,59 @@ mod tests {
     use hickory_proto::rr::{DNSClass, Name, Record, RecordType};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn dns_query_and_response() -> (Vec<u8>, Vec<u8>) {
+        let mut query = Message::new();
+        query.set_id(0x5151);
+        query.set_message_type(MessageType::Query);
+        query.set_op_code(OpCode::Query);
+        let question = Query::query(Name::from_str("example.com.").unwrap(), RecordType::A);
+        query.add_query(question.clone());
+
+        let mut response = Message::new();
+        response.set_id(0x5151);
+        response.set_message_type(MessageType::Response);
+        response.set_op_code(OpCode::Query);
+        response.add_query(question);
+        (query.to_vec().unwrap(), response.to_vec().unwrap())
+    }
+
+    async fn spawn_raw_doh_response(
+        body: Vec<u8>,
+        chunked: bool,
+        content_type: &'static str,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = if chunked {
+                let mut framed = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                framed.extend_from_slice(&body);
+                framed.extend_from_slice(b"\r\n0\r\n\r\n");
+                framed
+            } else {
+                let mut framed = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                framed.extend_from_slice(&body);
+                framed
+            };
+            stream.write_all(&response).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        addr
+    }
 
     #[test]
     fn normalize_dns_name_strips_trailing_dot() {
@@ -1051,6 +1156,169 @@ mod tests {
             .expect("collect body")
             .to_bytes();
         assert_eq!(body.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn doh_client_completes_content_length_without_connection_close() {
+        let (query, response) = dns_query_and_response();
+        let addr = spawn_raw_doh_response(response.clone(), false, "application/dns-message").await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_millis(500),
+            doh_request_over_io(stream, "localhost", "/dns-query", &query),
+        )
+        .await
+        .expect("client waited for connection close")
+        .expect("valid DoH response");
+        assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn doh_client_completes_chunked_without_connection_close() {
+        let (query, response) = dns_query_and_response();
+        let addr = spawn_raw_doh_response(response.clone(), true, "application/dns-message").await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_millis(500),
+            doh_request_over_io(stream, "localhost", "/dns-query", &query),
+        )
+        .await
+        .expect("client waited for connection close")
+        .expect("valid DoH response");
+        assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn doh_client_rejects_wrong_content_type() {
+        let (query, response) = dns_query_and_response();
+        let addr = spawn_raw_doh_response(response, false, "text/plain").await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let error = doh_request_over_io(stream, "localhost", "/dns-query", &query)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn doh_failure_mode_controls_udp_fallback() {
+        let (query, response) = dns_query_and_response();
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = udp.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; MAX_DNS_PACKET];
+            let (_, peer) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(&response, peer).await.unwrap();
+        });
+
+        let metrics = metrics::Metrics::default();
+        let reply = query_upstream(
+            &query,
+            upstream,
+            Some("not a URL"),
+            DohFailureMode::FallbackUdp,
+            &metrics,
+        )
+        .await
+        .expect("UDP fallback");
+        assert!(QueryKey::from_query_bytes(&query)
+            .unwrap()
+            .matches_reply_bytes(&reply));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dns_doh_query_total, 1);
+        assert_eq!(snapshot.dns_doh_failure_total, 1);
+        assert_eq!(snapshot.dns_udp_fallback_total, 1);
+        assert_eq!(snapshot.dns_response_completed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn fail_closed_never_contacts_udp_upstream() {
+        let (query, _) = dns_query_and_response();
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = udp.local_addr().unwrap();
+        let metrics = metrics::Metrics::default();
+        assert!(query_upstream(
+            &query,
+            upstream,
+            Some("not a URL"),
+            DohFailureMode::FailClosed,
+            &metrics,
+        )
+        .await
+        .is_err());
+
+        let mut buf = [0u8; MAX_DNS_PACKET];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), udp.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dns_udp_fallback_total, 0);
+        assert_eq!(snapshot.dns_upstream_failure_total, 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_query_is_not_delayed_by_stalled_upstream() {
+        let reservation = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let stalled_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = stalled_upstream.local_addr().unwrap();
+
+        let policy_engine = Arc::new(
+            policy::PolicyEngine::load_from_file(
+                std::path::Path::new("docs/policy_full.json"),
+                Some(policy::PolicyMode::Enforce),
+            )
+            .unwrap(),
+        );
+        assert!(
+            policy_engine
+                .plan_for_dns_query("doubleclick.net")
+                .should_block
+        );
+        let metrics = Arc::new(metrics::Metrics::default());
+        let task = tokio::spawn(run_dns_filter(DnsFilterConfig {
+            listen_addr,
+            upstream_addr,
+            upstream_doh: None,
+            doh_failure_mode: DohFailureMode::FailClosed,
+            max_inflight: 1,
+            policy_engine,
+            metrics,
+            receipts_store: None,
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (allowed, _) = dns_query_and_response();
+        client.send_to(&allowed, listen_addr).await.unwrap();
+
+        let mut blocked = Message::new();
+        blocked.set_id(0x6161);
+        blocked.set_message_type(MessageType::Query);
+        blocked.set_op_code(OpCode::Query);
+        blocked.add_query(Query::query(
+            Name::from_str("doubleclick.net.").unwrap(),
+            RecordType::A,
+        ));
+        let started = tokio::time::Instant::now();
+        client
+            .send_to(&blocked.to_vec().unwrap(), listen_addr)
+            .await
+            .unwrap();
+        let mut reply = [0u8; MAX_DNS_PACKET];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut reply))
+                .await
+                .expect("blocked response was delayed by the stalled upstream")
+                .unwrap();
+        let response = Message::from_bytes(&reply[..len]).unwrap();
+        assert_eq!(response.id(), 0x6161);
+        assert_eq!(response.response_code(), ResponseCode::NXDomain);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        task.abort();
+        drop(stalled_upstream);
     }
 
     #[test]

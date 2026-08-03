@@ -15,6 +15,12 @@ pub struct Metrics {
     dns_query_total: AtomicU64,
     dns_blocked_total: AtomicU64,
     dns_report_only_total: AtomicU64,
+    dns_doh_query_total: AtomicU64,
+    dns_doh_failure_total: AtomicU64,
+    dns_udp_fallback_total: AtomicU64,
+    dns_upstream_failure_total: AtomicU64,
+    dns_query_saturated_total: AtomicU64,
+    dns_response_completed_total: AtomicU64,
     body_rewrite_total: AtomicU64,
     body_rewrite_skipped_total: AtomicU64,
     body_rewrite_bytes_injected_total: AtomicU64,
@@ -48,6 +54,12 @@ pub struct MetricsSnapshot {
     pub dns_query_total: u64,
     pub dns_blocked_total: u64,
     pub dns_report_only_total: u64,
+    pub dns_doh_query_total: u64,
+    pub dns_doh_failure_total: u64,
+    pub dns_udp_fallback_total: u64,
+    pub dns_upstream_failure_total: u64,
+    pub dns_query_saturated_total: u64,
+    pub dns_response_completed_total: u64,
     pub body_rewrite_total: u64,
     pub body_rewrite_skipped_total: u64,
     pub body_rewrite_bytes_injected_total: u64,
@@ -118,6 +130,33 @@ impl Metrics {
 
     pub fn inc_dns_report_only_total(&self) {
         self.dns_report_only_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_doh_query_total(&self) {
+        self.dns_doh_query_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_doh_failure_total(&self) {
+        self.dns_doh_failure_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_udp_fallback_total(&self) {
+        self.dns_udp_fallback_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_upstream_failure_total(&self) {
+        self.dns_upstream_failure_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_query_saturated_total(&self) {
+        self.dns_query_saturated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dns_response_completed_total(&self) {
+        self.dns_response_completed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_body_rewrite_total(&self) {
@@ -217,6 +256,12 @@ impl Metrics {
             dns_query_total: self.dns_query_total.load(Ordering::Relaxed),
             dns_blocked_total: self.dns_blocked_total.load(Ordering::Relaxed),
             dns_report_only_total: self.dns_report_only_total.load(Ordering::Relaxed),
+            dns_doh_query_total: self.dns_doh_query_total.load(Ordering::Relaxed),
+            dns_doh_failure_total: self.dns_doh_failure_total.load(Ordering::Relaxed),
+            dns_udp_fallback_total: self.dns_udp_fallback_total.load(Ordering::Relaxed),
+            dns_upstream_failure_total: self.dns_upstream_failure_total.load(Ordering::Relaxed),
+            dns_query_saturated_total: self.dns_query_saturated_total.load(Ordering::Relaxed),
+            dns_response_completed_total: self.dns_response_completed_total.load(Ordering::Relaxed),
             body_rewrite_total: self.body_rewrite_total.load(Ordering::Relaxed),
             body_rewrite_skipped_total: self.body_rewrite_skipped_total.load(Ordering::Relaxed),
             body_rewrite_bytes_injected_total: self
@@ -264,6 +309,12 @@ impl Metrics {
             dns_query_total = s.dns_query_total,
             dns_blocked_total = s.dns_blocked_total,
             dns_report_only_total = s.dns_report_only_total,
+            dns_doh_query_total = s.dns_doh_query_total,
+            dns_doh_failure_total = s.dns_doh_failure_total,
+            dns_udp_fallback_total = s.dns_udp_fallback_total,
+            dns_upstream_failure_total = s.dns_upstream_failure_total,
+            dns_query_saturated_total = s.dns_query_saturated_total,
+            dns_response_completed_total = s.dns_response_completed_total,
             body_rewrite_total = s.body_rewrite_total,
             body_rewrite_skipped_total = s.body_rewrite_skipped_total,
             body_rewrite_bytes_injected_total = s.body_rewrite_bytes_injected_total,
@@ -305,6 +356,12 @@ mod tests {
         m.inc_dns_query_total();
         m.inc_dns_blocked_total();
         m.inc_dns_report_only_total();
+        m.inc_dns_doh_query_total();
+        m.inc_dns_doh_failure_total();
+        m.inc_dns_udp_fallback_total();
+        m.inc_dns_upstream_failure_total();
+        m.inc_dns_query_saturated_total();
+        m.inc_dns_response_completed_total();
         m.inc_body_rewrite_total();
         m.inc_body_rewrite_skipped_total();
         m.add_body_rewrite_bytes_injected_total(1727);
@@ -336,6 +393,12 @@ mod tests {
         assert_eq!(s.dns_query_total, 1);
         assert_eq!(s.dns_blocked_total, 1);
         assert_eq!(s.dns_report_only_total, 1);
+        assert_eq!(s.dns_doh_query_total, 1);
+        assert_eq!(s.dns_doh_failure_total, 1);
+        assert_eq!(s.dns_udp_fallback_total, 1);
+        assert_eq!(s.dns_upstream_failure_total, 1);
+        assert_eq!(s.dns_query_saturated_total, 1);
+        assert_eq!(s.dns_response_completed_total, 1);
         assert_eq!(s.body_rewrite_total, 1);
         assert_eq!(s.body_rewrite_skipped_total, 1);
         assert_eq!(s.body_rewrite_bytes_injected_total, 1727);

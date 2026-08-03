@@ -1,6 +1,6 @@
 # Privacy Engine (Rust)
 
-Privacy Engine is a Rust based HTTPS interception proxy designed to strip trackers, block ads, and protect your privacy at the network level. Rather than running as a browser extension that only covers one tab, it sits between your entire device (or network) and the internet, its decrypting, inspecting, rewriting, and re-encrypting traffic before it ever reaches your browser. It works across every app, every tab, and every device you route through it.
+Privacy Engine is a local Rust HTTPS proxy and DNS pre-filter for traffic you explicitly route through it. It can inspect and rewrite supported HTTP/1.1 HTML responses, apply DNS block rules, and record auditable privacy receipts. It is not a VPN and does not automatically capture every application or device.
 
 **Disclaimer:** This tool is intended for personal use on networks and devices you own or have explicit permission to monitor. Intercepting traffic without authorization is illegal in most jurisdictions. The MITM capability is designed for privacy protection on your own traffic — not for inspecting others. Use responsibly.
 
@@ -12,7 +12,7 @@ Privacy Engine is a Rust based HTTPS interception proxy designed to strip tracke
 
 **DNS Pre-Filter:** Listens on a local UDP port and returns NXDOMAIN for blocked domains before a connection is even opened. Supports CNAME uncloaking and follows CNAME chains and blocks if the resolved target is a known tracker, even if the alias looks first party.
 
-**Encrypted DNS:** Forwards DNS queries upstream over HTTPS (DoH) to Cloudflare or Quad9 instead of plaintext UDP. Also exposes its own DoH server endpoint so any device on your network can use it.
+**Encrypted DNS:** Forwards allowed DNS queries over framed HTTP/1.1 DoH with strict response validation. The portable profile fails closed; the mirrored-WSL profile can fall back to UDP with explicit metrics. An optional local DoH server is available when separately configured with a certificate and key.
 
 **Query Parameter Stripping:** Removes tracking parameters from outbound request URLs before they reach the server `fbclid`, `gclid`, `utm_source`, `utm_medium`, `utm_campaign`, `_ga`, `msclkid`, and more.
 
@@ -49,10 +49,10 @@ git clone https://github.com/plunder707/privacy-engine.git
 cd privacy-engine-rust
 ```
 
-Build and run with EasyList (recommended) downloads EasyList and starts with DNS + filter list support):
+Build and restart with the portable EasyList profile:
 
 ```bash
-./scripts/run_easylist_local.sh
+./scripts/pe-restart.sh configs/easylist.local.json
 ```
 
 Or run with the basic config (MITM + dashboard, no DNS or filter lists):
@@ -61,22 +61,24 @@ Or run with the basic config (MITM + dashboard, no DNS or filter lists):
 ./scripts/run_engine_config.sh configs/basic.local.json
 ```
 
-Trust the CA certificate the engine generates on first run. It's exported to `/tmp/pe_ca_cert_export.pem` and also available as a `.crt` download from the dashboard Setup Wizard.
+The restart helper builds before stopping the existing process, validates privileged DNS binding, and checks the proxy, dashboard, and DNS listeners. Mirrored WSL users should use `configs/easylist.wsl-mirrored.json`; see [`docs/WINDOWS_WSL_NETWORKING.md`](docs/WINDOWS_WSL_NETWORKING.md).
+
+Trust the CA certificate the engine generates on first run. The repository profiles export it to `certs/ca_cert_export.pem`, and the dashboard exposes the public certificate as a `.crt` download.
 
 **macOS:**
 ```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/pe_ca_cert_export.pem
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain certs/ca_cert_export.pem
 ```
 
 **Windows:** Download `ca.crt` from the dashboard Setup Wizard. Double click it, choose to install to **Local Machine**, and manually select **Trusted Root Certification Authorities** as the store (do not use auto-select).
 
 **Linux:**
 ```bash
-sudo cp /tmp/pe_ca_cert_export.pem /usr/local/share/ca-certificates/pe-ca.crt
+sudo cp certs/ca_cert_export.pem /usr/local/share/ca-certificates/pe-ca.crt
 sudo update-ca-certificates
 ```
 
-Set your browser or OS proxy to `127.0.0.1:18081` and open the dashboard at `http://127.0.0.1:9090/`.
+Set a browser or application proxy to `127.0.0.1:18081` and open the dashboard at `http://127.0.0.1:9090/`. The engine does not change Windows proxy, DNS, NordVPN, or Tailscale settings.
 
 ## Engine Configuration
 
@@ -96,6 +98,9 @@ The engine accepts a single JSON config file to avoid long CLI invocations. All 
   "enable_dns_filter": true,
   "dns_listen_port": 5353,
   "dns_upstream": "1.1.1.1:53",
+  "dns_upstream_doh": "https://cloudflare-dns.com/dns-query",
+  "dns_doh_failure_mode": "fail_closed",
+  "dns_max_inflight": 128,
   "filter_list_url": ["https://easylist.to/easylist/easylist.txt"],
   "filter_list_cache_dir": "/tmp",
   "dashboard_port": 9090
@@ -155,7 +160,8 @@ privacy-engine-rust/
 │
 ├── configs/
 │   ├── basic.local.json         — MITM + receipts + dashboard (no DNS/filter lists)
-│   └── easylist.local.json      — Full config: DNS + EasyList + dashboard
+│   ├── easylist.local.json      — Portable loopback DNS + EasyList profile
+│   └── easylist.wsl-mirrored.json — Mirrored-WSL DNS profile
 │
 ├── docs/
 │   ├── policy_full.json         — Complete policy config (41 tracker domains)
@@ -202,7 +208,7 @@ cargo test
 cargo build --release
 ```
 
-227 tests, 0 failures. Tests cover: DNS parsing, NXDOMAIN building, CNAME chain inspection, filter list parsing (domain blocks, URL patterns, exceptions, cosmetic selectors), chunked TE decode/re-encode, gzip/deflate/brotli roundtrips, HTML rewriting, keep-alive response completion, framing invariants, and flush failures, query param stripping, cache header stripping, referer injection, policy evaluation, consent enforcement, multi-user profiles, TOFU cert pinning, dashboard API endpoints, DoH stats, receipt persistence and pruning, host store grace period, TLS profile ordering.
+The suite covers DNS parsing, strict and fallback DoH behavior, keep-alive HTTP framing, bounded DNS concurrency, NXDOMAIN responses, CNAME inspection, filter-list parsing, compressed and chunked HTML rewriting, response completion, policy evaluation, receipts, dashboard APIs, certificate pinning, and TLS profiles.
 
 ## Customization
 
@@ -212,13 +218,15 @@ cargo build --release
 
 **Adjust consent levels:** Set `"default"` under `consent` to `essential_only`, `analytics_ok`, or `all`. Add per-IP overrides in the `users` array.
 
-**Use a different DNS upstream:** Change `dns_upstream` to any IP:port, or set `dns_upstream_doh` to a DoH URL (e.g., `"https://9.9.9.9/dns-query"` for Quad9).
+**Use a different DNS upstream:** Change `dns_upstream` to an IP and port or set `dns_upstream_doh` to a DoH URL. Choose `dns_doh_failure_mode: "fail_closed"` to forbid downgrade or `"fallback_udp"` to permit a measured UDP fallback.
 
 **Add your own filter lists:** Add local file paths to `filter_list_file` or URLs to `filter_list_url` in the engine config. Both EasyList and AdGuard formats are supported.
 
 ## Safety
 
 - Do not expose the proxy listener on a public interface without adding authentication first. By default it is an open proxy.
+- Do not expose the DNS or optional DoH listeners beyond trusted interfaces without an explicit access policy.
+- UDP fallback is plaintext DNS. Use `fail_closed` when encrypted upstream transport is mandatory.
 - The generated CA is a local root certificate authority. Treat the private key (`mitm_ca_key.pem`) like any root CA key, DO NOT share it or commit it to version control.
 - Remove the CA from your system trust store when you're done testing.
 - Pre-add payment processors and cert-pinned apps to the passthrough list. Stripe, Google Pay, PayPal, and similar services use certificate pinning and will not function correctly under MITM interception.

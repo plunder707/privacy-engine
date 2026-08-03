@@ -50,6 +50,8 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 - `dns_listen_port` (number)
 - `dns_upstream` (string, e.g. `"1.1.1.1:53"`)
 - `dns_upstream_doh` (DoH URL string or `null`)
+- `dns_doh_failure_mode` (`"fail_closed"`, default, or `"fallback_udp"`)
+- `dns_max_inflight` (positive number, default `128`)
 
 - `filter_list_file` (array of string paths)
 - `filter_list_url` (array of strings)
@@ -66,7 +68,8 @@ All keys are optional; unspecified keys use the same defaults as the CLI.
 See:
 
 - `configs/basic.local.json` (MITM + receipts + dashboard)
-- `configs/easylist.local.json` (adds DNS + EasyList)
+- `configs/easylist.local.json` (portable `127.0.0.1:5353`, strict DoH)
+- `configs/easylist.wsl-mirrored.json` (operator-specific `127.0.0.2:53`, measured UDP fallback)
 - `scripts/run_easylist_local.sh` (downloads EasyList to `/tmp/easylist.txt` and starts the engine)
 
 Operational note:
@@ -83,6 +86,13 @@ Operational note:
   crosses an explicit client flush boundary. The dashboard exposes completed
   flushes, flush failures, incomplete responses, and injected bytes separately
   from rewrite-attempt counters.
+- DoH responses are completed by HTTP framing, not connection closure. Status,
+  media type, bounded body size, DNS parsing, transaction ID, and question are
+  validated before delivery.
+- `fallback_udp` never fails silently: DoH failures, UDP fallbacks, upstream
+  failures, saturation drops, and completed DNS responses are separate metrics.
+- DNS block decisions happen before upstream admission. One stalled upstream
+  query cannot delay a local NXDOMAIN response.
 - Auto-pin is suppressed during a fixed 60-second startup grace period. After
   that, a host must reach `auto_pin_reject_threshold` TLS failures inside
   `auto_pin_reject_window_secs`; the first observation is logged/receipted as

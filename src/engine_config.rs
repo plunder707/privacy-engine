@@ -1,3 +1,4 @@
+use crate::dns_filter;
 use crate::mitm;
 use crate::policy;
 use serde_json::Value;
@@ -53,6 +54,8 @@ pub struct EngineConfig {
     pub dns_listen_port: u16,
     pub dns_upstream: String,
     pub dns_upstream_doh: Option<String>,
+    pub dns_doh_failure_mode: dns_filter::DohFailureMode,
+    pub dns_max_inflight: usize,
 
     pub filter_list_file: Vec<PathBuf>,
     pub filter_list_url: Vec<String>,
@@ -104,6 +107,8 @@ impl Default for EngineConfig {
             dns_listen_port: 5353,
             dns_upstream: "8.8.8.8:53".to_string(),
             dns_upstream_doh: None,
+            dns_doh_failure_mode: dns_filter::DohFailureMode::FailClosed,
+            dns_max_inflight: 128,
 
             filter_list_file: Vec::new(),
             filter_list_url: Vec::new(),
@@ -278,6 +283,8 @@ impl EngineConfig {
             "dns_listen_port",
             "dns_upstream",
             "dns_upstream_doh",
+            "dns_doh_failure_mode",
+            "dns_max_inflight",
             "filter_list_file",
             "filter_list_url",
             "filter_list_cache_dir",
@@ -416,8 +423,34 @@ impl EngineConfig {
         if let Some(v) = get_string_field(obj, "dns_upstream")? {
             cfg.dns_upstream = v;
         }
-        if let Some(v) = get_string_field(obj, "dns_upstream_doh")? {
-            cfg.dns_upstream_doh = Some(v);
+        if obj.contains_key("dns_upstream_doh") {
+            cfg.dns_upstream_doh = if obj.get("dns_upstream_doh").is_some_and(|v| v.is_null()) {
+                None
+            } else {
+                get_string_field(obj, "dns_upstream_doh")?
+            };
+        }
+        if let Some(v) = get_string_field(obj, "dns_doh_failure_mode")? {
+            cfg.dns_doh_failure_mode = dns_filter::DohFailureMode::parse_config_value(&v)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid dns_doh_failure_mode '{v}' (expected: fail_closed|fallback_udp)"
+                        ),
+                    )
+                })?;
+        }
+        if let Some(v) = get_u64_field(obj, "dns_max_inflight")? {
+            if v == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dns_max_inflight must be at least 1",
+                ));
+            }
+            cfg.dns_max_inflight = usize::try_from(v).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "dns_max_inflight is too large")
+            })?;
         }
 
         if let Some(v) = get_path_array_field(obj, "filter_list_file")? {
@@ -515,6 +548,8 @@ mod tests {
               "force_http1_for_filter_rewrite": false,
               "enable_dns_filter": true,
               "dns_upstream": "1.1.1.1:53",
+              "dns_doh_failure_mode": "fallback_udp",
+              "dns_max_inflight": 64,
               "filter_list_file": ["/tmp/easylist.txt"],
               "dashboard_port": 9090
             }"#,
@@ -533,6 +568,11 @@ mod tests {
         assert!(!cfg.force_http1_for_filter_rewrite);
         assert!(cfg.enable_dns_filter);
         assert_eq!(cfg.dns_upstream, "1.1.1.1:53");
+        assert_eq!(
+            cfg.dns_doh_failure_mode,
+            dns_filter::DohFailureMode::FallbackUdp
+        );
+        assert_eq!(cfg.dns_max_inflight, 64);
         assert_eq!(
             cfg.filter_list_file,
             vec![PathBuf::from("/tmp/easylist.txt")]
@@ -567,5 +607,13 @@ mod tests {
             err.to_string().contains("unknown engine config key"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn invalid_doh_failure_mode_is_rejected() {
+        let path = temp_file("engine_cfg_bad_doh_mode");
+        fs::write(&path, r#"{ "dns_doh_failure_mode": "silent" }"#).expect("write");
+        let err = EngineConfig::load_from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("invalid dns_doh_failure_mode"));
     }
 }

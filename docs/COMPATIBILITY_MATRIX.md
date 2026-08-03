@@ -17,6 +17,16 @@ Legend:
 | Android (Wi-Fi proxy mode) | Explicit proxy | PENDING | Requires device CA + Wi-Fi proxy; expect many pinned apps to passthrough. |
 | Android (VPN capture) | Transparent capture | PENDING | Not implemented in this repo. |
 
+## DNS Upstream Compatibility
+
+| Path | Result | Contract |
+|---|---|---|
+| DoH `Content-Length`, keep-alive | PASS | Completes at the framed body boundary; does not wait for socket close. |
+| DoH chunked, keep-alive | PASS | Hyper decodes the complete bounded body. |
+| Strict DoH failure | PASS | Query fails closed; plaintext UDP is not contacted. |
+| Configured UDP fallback | PASS | Fallback is bounded and increments dedicated telemetry. |
+| Local block during upstream stall | PASS | NXDOMAIN remains independent of upstream concurrency. |
+
 ## HTTP Response Shapes (Body Rewriting)
 
 Body rewriting runs in the HTTP/1.1 MITM relay path for HTML responses. Current support:
@@ -84,13 +94,10 @@ curl -vk --connect-to google.com:443:127.0.0.1:18081 https://google.com/
 
 ### 4) DNS pre-filter verification (optional)
 
-Start engine with DNS filter enabled:
+Start the portable profile with DNS filtering enabled:
 
 ```bash
-cargo run --release -- \
-  --enable-dns-filter \
-  --dns-listen-host 127.0.0.1 \
-  --dns-listen-port 5353
+./scripts/pe-restart.sh configs/easylist.local.json
 ```
 
 Validate:

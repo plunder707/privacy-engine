@@ -172,6 +172,14 @@ struct Args {
     #[arg(long)]
     dns_upstream_doh: Option<String>,
 
+    /// Action when the configured DoH upstream fails.
+    #[arg(long, value_enum, default_value_t = dns_filter::DohFailureMode::FailClosed)]
+    dns_doh_failure_mode: dns_filter::DohFailureMode,
+
+    /// Maximum concurrent DNS queries waiting on an upstream response.
+    #[arg(long, default_value_t = 128)]
+    dns_max_inflight: usize,
+
     /// Load ABP/EasyList filter list from a local file (repeatable).
     #[arg(long, value_name = "PATH")]
     filter_list_file: Vec<PathBuf>,
@@ -250,6 +258,8 @@ fn apply_engine_config(args: &mut Args, cfg: engine_config::EngineConfig) {
     if cfg.dns_upstream_doh.is_some() {
         args.dns_upstream_doh = cfg.dns_upstream_doh;
     }
+    args.dns_doh_failure_mode = cfg.dns_doh_failure_mode;
+    args.dns_max_inflight = cfg.dns_max_inflight;
 
     args.filter_list_file = cfg.filter_list_file;
     args.filter_list_url = cfg.filter_list_url;
@@ -773,6 +783,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen_addr: dns_listen_addr,
             upstream_addr: dns_upstream_addr,
             upstream_doh: args.dns_upstream_doh.clone(),
+            doh_failure_mode: args.dns_doh_failure_mode,
+            max_inflight: args.dns_max_inflight,
             policy_engine: Arc::clone(&policy_engine),
             metrics: Arc::clone(&metrics),
             receipts_store: receipts_store.clone(),
@@ -785,6 +797,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event = "dns_filter_enabled",
                 dns_listen = %format!("{}:{}", args.dns_listen_host, args.dns_listen_port),
                 dns_upstream_doh = %doh,
+                dns_doh_failure_mode = ?args.dns_doh_failure_mode,
+                dns_max_inflight = args.dns_max_inflight,
                 "DNS pre-filter task spawned (DoH)"
             );
         } else {
@@ -859,6 +873,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key,
             upstream_addr: dns_upstream_addr,
             upstream_doh: args.dns_upstream_doh.clone(),
+            doh_failure_mode: args.dns_doh_failure_mode,
             stats: doh_stats
                 .as_ref()
                 .map(Arc::clone)
