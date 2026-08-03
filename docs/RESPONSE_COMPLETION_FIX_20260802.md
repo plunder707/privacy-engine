@@ -98,11 +98,24 @@ identity, Git state, fixture settings, and per-run hashes.
 
 ## Rollout
 
-The candidate was validated on isolated proxy ports. The existing `18081/9090`
-process was not restarted or modified during validation.
+The candidate was first validated on isolated proxy ports, then promoted to
+`fix/request-stream-inspection`. The live service was restarted from commit
+`6151e89` with binary SHA-256
+`f807d221c22f57a496ef4b0ad3625c77c7868d02070ee767f00bf3f926c4453d`.
+
+The post-promotion `www.wikipedia.org` identity-encoding canary completed in
+0.096 seconds with 122,088 advertised and received bytes. Runtime telemetry
+recorded one completed flush, 1,727 injected bytes, and zero flush failures,
+incomplete responses, or Content-Length mismatches. A Windows client also
+completed an HTTPS request through `127.0.0.1:18081`.
 
 The tracked local configuration now preserves the mirrored-WSL DNS binding
 required on this machine (`127.0.0.2:53`), the DoH upstream, and explicit
 HTTP/1.1 rewrite behavior. Promotion must retain the existing CA and runtime
 state directories. Rollback is the previous binary and configuration; no CA,
 receipt, filter-list, or pin database migration is required.
+
+The restart helper now builds before stopping the current process, checks the
+port-53 file capability before disruption, detaches the service into a new
+session, and verifies the proxy, dashboard, and DNS listeners before reporting
+success.
