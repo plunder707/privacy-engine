@@ -85,8 +85,8 @@
   "policy_mode": "enforce",
   "policy_reload_interval_secs": 5,
   "enable_dns_filter": true,
-  "dns_listen_host": "127.0.0.1",
-  "dns_listen_port": 5353,
+  "dns_listen_host": "127.0.0.2",
+  "dns_listen_port": 53,
   "dns_upstream": "1.1.1.1:53",
   "filter_list_file": [
     "state/easylist.txt"
@@ -99,5 +99,7 @@
   "metrics_log_interval_secs": 30,
   "dashboard_port": 9090,
   "cert_log_file": "state/pe_cert_log.jsonl",
-  "cert_pin_file": "state/pe_cert_pins.json"
+  "cert_pin_file": "state/pe_cert_pins.json",
+  "force_http1_for_filter_rewrite": true,
+  "dns_upstream_doh": "https://cloudflare-dns.com/dns-query"
 }

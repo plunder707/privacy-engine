@@ -7,8 +7,8 @@ The rewritten-response stall was caused by a missing client flush boundary.
 leave the final TLS records buffered indefinitely. The relay then waited for
 more upstream data while the client waited for the remaining response bytes.
 
-This was independent of DNS, Tailscale, VPN state, chunked framing, and body
-size. The failure reproduced on `www.wikipedia.org` with identity encoding:
+This was independent of DNS, Tailscale, and VPN state. The original public
+reproduction was `www.wikipedia.org` with identity encoding:
 
 | Build | Advertised | Received | Result |
 | --- | ---: | ---: | --- |
@@ -17,7 +17,25 @@ size. The failure reproduced on `www.wikipedia.org` with identity encoding:
 
 The candidate also completed three repeated Wikipedia probes, a 609 KB
 Content-Length response, a 1.3 MB rewritten response, and the compressed
-Wikipedia response. All advertised Content-Length values matched bytes read.
+Wikipedia response. Those cases are regression controls, not independent proof
+of the repair, because they already completed with the previous build.
+
+The causal evidence is an end-to-end size sweep against a local HTTPS origin.
+The origin served Content-Length HTML, kept the upstream connection open, and
+varied the source body from 1 KiB through just over 2 MiB. The request traversed
+the real proxy and body-rewrite path; rewritten bodies gained the 1,727-byte
+anti-overlay shim.
+
+| Build | Passed | Failed | Result |
+| --- | ---: | ---: | --- |
+| Previous deployed binary | 155 / 188 | 33 | failures timed out with partial bodies |
+| Candidate | 188 / 188 | 0 | every advertised length was delivered |
+
+The old failures spanned source bodies from 115,712 through 1,983,488 bytes and
+several partial-delivery plateaus. The defect was therefore size- and
+timing-sensitive, not Wikipedia-specific. The missing response-boundary flush
+explains the broader failure class; the candidate eliminated it across the
+entire sweep.
 
 ## Runtime Contract
 
@@ -32,6 +50,11 @@ Buffered Content-Length and chunked responses now use one completion path:
 `response_flush_completed_total` means the completed response crossed the
 runtime's `AsyncWrite::flush` boundary. It does not claim application-level
 acknowledgement by the remote client.
+
+The Content-Length validation is defense in depth. Rewriting normally computes
+the header immediately before this function, so the validation primarily
+protects future call sites and catches an internal framing regression. The
+flush boundary is the delivery repair.
 
 ## Observability
 
@@ -60,9 +83,26 @@ called while the upstream remains open. It covers:
 The full suite passes with 227 tests. Strict Clippy and the release build also
 pass.
 
+The sweep is reproducible with `scripts/response_size_sweep.py`. Local evidence
+is bound to the exact binaries and source state:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Previous results JSONL | `8ba63d27916c130f0a0c8290986660a75f282fca7a7867763eacb2c54d4f8188` |
+| Candidate results JSONL | `fa50ac66f9dfe8f56168f3089490dfdaf5c490dbe701e443ee49a5a046b2d56c` |
+| Previous binary | `898713cbb0c4dbd0bbf264034ec28c8e0cf347f9142395b7f8034d888a06431f` |
+| Candidate binary | `26c03d7393e1b38c246d8dfb400dd358ad46cd3a08619fde4a10c8825ab81283` |
+
+The raw JSONL files remain local and gitignored. Their manifests record binary
+identity, Git state, fixture settings, and per-run hashes.
+
 ## Rollout
 
-The candidate was validated on isolated proxy/dashboard ports `18082/9091`.
-The existing `18081/9090` process was not restarted or modified. Promotion
-should use the normal restart path only after the branch is reviewed and the
-existing dirty runtime configuration is reconciled separately.
+The candidate was validated on isolated proxy ports. The existing `18081/9090`
+process was not restarted or modified during validation.
+
+The tracked local configuration now preserves the mirrored-WSL DNS binding
+required on this machine (`127.0.0.2:53`), the DoH upstream, and explicit
+HTTP/1.1 rewrite behavior. Promotion must retain the existing CA and runtime
+state directories. Rollback is the previous binary and configuration; no CA,
+receipt, filter-list, or pin database migration is required.
