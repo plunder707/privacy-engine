@@ -25,8 +25,18 @@ pub struct EngineConfig {
     pub mitm_ca_generate_if_missing: bool,
     pub mitm_ca_export_cert_file: Option<PathBuf>,
     pub tls_profile: mitm::TlsProfile,
-    /// Keep rewritable connections on HTTP/1.1 so the byte-oriented response
-    /// parser can enforce body policies. Disable to prefer HTTP/2 passthrough.
+    /// Keep rewritable connections on HTTP/1.1.
+    ///
+    /// The body rewriter is an HTTP/1.1 byte parser: it locates `\r\n\r\n`,
+    /// reads `Content-Length`, and decodes chunked framing. None of that
+    /// applies to HTTP/2's binary framing, so when ALPN negotiates `h2` the
+    /// rewriter silently does nothing.
+    ///
+    /// Filter-list rules (EasyList) set `should_rewrite` without setting any
+    /// manual pattern, and only manual patterns previously forced HTTP/1.1.
+    /// The result was tens of thousands of active rules that could never fire.
+    /// Enabling this trades HTTP/2 multiplexing for rewriting that actually
+    /// runs; disable it to prefer raw speed over filtering.
     pub force_http1_for_filter_rewrite: bool,
 
     pub metrics_log_interval_secs: u64,
@@ -76,6 +86,8 @@ impl Default for EngineConfig {
             mitm_ca_generate_if_missing: true,
             mitm_ca_export_cert_file: None,
             tls_profile: mitm::TlsProfile::Default,
+            // Default on: a filter list that cannot fire is worse than a lost
+            // multiplexing optimisation, and the failure is invisible.
             force_http1_for_filter_rewrite: true,
 
             metrics_log_interval_secs: 30,

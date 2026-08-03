@@ -145,8 +145,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = mitm::TlsProfile::Default)]
     tls_profile: mitm::TlsProfile,
 
-    /// Keep rewritable connections on HTTP/1.1. The body rewriter does not
-    /// parse HTTP/2 frames, so disabling this makes filter rewriting best-effort.
+    /// Keep connections on HTTP/1.1 whenever body rewriting is planned. The body
+    /// rewriter only understands HTTP/1.1 framing, so filter-list rules cannot
+    /// fire over HTTP/2. Disable to prefer h2 multiplexing over filtering.
     #[arg(long, default_value_t = true)]
     force_http1_for_filter_rewrite: bool,
 

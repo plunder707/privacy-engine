@@ -234,6 +234,9 @@ pub struct MitmEngine {
     upstream_client_config_http1: Arc<ClientConfig>,
     cert_log: Option<Arc<CertLog>>,
     cert_pin_db: Option<Arc<crate::cert_pin::CertPinDb>>,
+    /// See `EngineConfig::force_http1_for_filter_rewrite`. The body rewriter
+    /// only understands HTTP/1.1 framing, so filter-list rewriting cannot run
+    /// on an `h2` connection.
     force_http1_for_filter_rewrite: bool,
 }
 
@@ -313,6 +316,15 @@ impl MitmEngine {
         let manual_rewrite_active = body_rewrite_plan.strip_tracking_pixels
             || !body_rewrite_plan.manual_script_patterns.is_empty()
             || !body_rewrite_plan.manual_remove_selectors.is_empty();
+        // Force HTTP/1.1 when we must (Set-Cookie policy), when the user configured
+        // manual rewrite rules, or when any rewriting is planned at all and the
+        // operator has opted into correctness over multiplexing.
+        //
+        // The last case matters: filter-list rules set should_rewrite without
+        // setting any manual pattern, so previously a policy with tens of
+        // thousands of active EasyList rules still negotiated h2 — and the
+        // HTTP/1.1 body parser then found no framing it understood and did
+        // nothing, silently, on every modern site.
         let force_http1 = plan.enable_http1_set_cookie_filter
             || manual_rewrite_active
             || (self.force_http1_for_filter_rewrite && body_rewrite_plan.should_rewrite);
