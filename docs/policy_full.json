@@ -151,7 +151,6 @@
         "div#gateway-content",
         "iframe[name='__gateLocator']",
         "iframe[src*='regiwall']",
-        "iframe[src*='auth/iframe']",
         "iframe[src*='onboarding-offer']",
         "iframe[src*='piano.io']",
         "iframe[src*='tinypass.com']",

@@ -1649,9 +1649,32 @@ fn rewrite_html_body(
             .map(|s| format!("{s}{{display:none!important}}"))
             .collect::<Vec<_>>()
             .join("");
-        // JS shim: aggressive scroll-lock prevention + overlay killing.
-        // Fixes: overflow:hidden, position:fixed on body, pointer-events:none,
-        // and removes high-z-index overlay divs that block interaction.
+        // JS shim: scroll-lock release ONLY.
+        //
+        // This previously also forced `position:fixed -> static`, forced
+        // `pointer-events:none -> auto`, hid every div with z-index > 999999,
+        // and re-ran the whole thing on setInterval(fix, 800) forever. Measured
+        // 2026-09-28, all three of those break the sites a user most needs:
+        //
+        //   * z-index > 999999 is the CONVENTION for login modals and payment
+        //     sheets, not for ads. The rule hid the UI the moment it appeared,
+        //     and the 800ms timer kept hiding modals that opened later, so a
+        //     retry could never succeed - the injection is deterministic and
+        //     re-applied on every load.
+        //   * forcing position:static breaks sticky headers and the sheets
+        //     themselves.
+        //   * forcing pointer-events:auto defeats a page's intentional
+        //     click-blocking backdrop, so clicks land on the wrong element.
+        //
+        // The engine's own counters show the price of keeping them: injection
+        // ran on every rewritten page while removed_script_total and
+        // removed_pixel_total stayed at 0 globally, and body_rewrite_total
+        // fired 17 times on v51.ez-pay.io (a payment host), 8 on
+        // jsapi.login.yahoo.com and 3 on payments.google.com.
+        //
+        // The scroll-lock release is kept: releasing overflow:hidden restores
+        // the ability to scroll a page whose modal has been dismissed, and it
+        // hides nothing and rewrites no geometry.
         let scroll_js = concat!(
             "<script data-pe=\"1\">(function(){",
             "function fix(){",
@@ -1660,19 +1683,8 @@ fn rewrite_html_body(
             "var c=getComputedStyle(el);",
             "if(c.overflow==='hidden'||c.overflow==='clip')el.style.setProperty('overflow','auto','important');",
             "if(c.overflowY==='hidden'||c.overflowY==='clip')el.style.setProperty('overflow-y','auto','important');",
-            "if(c.position==='fixed')el.style.setProperty('position','static','important');",
-            "if(c.pointerEvents==='none')el.style.setProperty('pointer-events','auto','important');",
             "el.style.removeProperty('touch-action');",
             "});",
-            "if(b){",
-            "var overlays=b.querySelectorAll('div');",
-            "for(var i=0;i<overlays.length;i++){",
-            "var el=overlays[i];var c=getComputedStyle(el);",
-            "var z=parseInt(c.zIndex,10);",
-            "if(z>999999&&(c.position==='fixed'||c.position==='absolute')){",
-            "el.style.setProperty('display','none','important');",
-            "}}",
-            "}",
             "}",
             "var o=new MutationObserver(function(){fix()});",
             "fix();",
@@ -1682,7 +1694,6 @@ fn rewrite_html_body(
             "clearInterval(bi);fix();",
             "o.observe(document.body,{attributes:true,attributeFilter:['style','class'],subtree:false,childList:true});",
             "}},20);",
-            "setInterval(fix,800);",
             "})()</script>"
         );
         let style_tag = if inject_css.is_empty() {
