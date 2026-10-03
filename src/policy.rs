@@ -44,6 +44,43 @@ impl PolicyMode {
     }
 }
 
+/// Decides which hosts are worth forcing onto HTTP/1.1 so the body rewriter
+/// can run at all.
+///
+/// Measured on the live proxy: 241 hosts had receipts, 24 had ever been
+/// rewritten, and exactly 1 had ever removed anything. Replayed through the
+/// real parser and the shipped policy, `HostScoped` keeps rewriting on 53 of
+/// those 241 hosts and releases the other 188 from HTTP/1.1, including 14 of
+/// the 24 that had been rewritten for no measured benefit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteScope {
+    /// Rewrite only hosts with a host-keyed reason: a Referer-spoof rule,
+    /// domain-scoped cosmetic rules, a consent/tracker Set-Cookie match, a
+    /// configured probe, or recorded evidence of a past removal.
+    HostScoped,
+    /// Legacy: rewrite every host whenever policy is enabled. Retained so the
+    /// old behaviour can be restored from config without a rebuild.
+    Global,
+}
+
+impl RewriteScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HostScoped => "host_scoped",
+            Self::Global => "global",
+        }
+    }
+
+    fn parse_config_value(s: &str) -> Option<Self> {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "host_scoped" | "host-scoped" | "hostscoped" => Some(Self::HostScoped),
+            "global" | "all" | "legacy" => Some(Self::Global),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentLevel {
     EssentialOnly,
@@ -158,6 +195,11 @@ pub struct BodyRewriteRule {
     pub max_body_bytes: usize,
     pub referer_spoof_domains: HashSet<String>,
     pub query_param_strip_enabled: bool,
+    pub rewrite_scope: RewriteScope,
+    /// Hosts allowed to be rewritten with no prior evidence, so they can
+    /// demonstrate productivity. Empty by default: on a cold start nothing is
+    /// rewritten except hosts covered by the static host-keyed rules.
+    pub probe_hosts: HashSet<String>,
 }
 
 impl Default for BodyRewriteRule {
@@ -171,6 +213,8 @@ impl Default for BodyRewriteRule {
             max_body_bytes: 2 * 1024 * 1024, // 2MB
             referer_spoof_domains: HashSet::new(),
             query_param_strip_enabled: false,
+            rewrite_scope: RewriteScope::HostScoped,
+            probe_hosts: HashSet::new(),
         }
     }
 }
@@ -535,6 +579,8 @@ impl PolicyConfig {
                 "max_body_bytes",
                 "referer_spoof_domains",
                 "query_param_strip_enabled",
+                "rewrite_scope",
+                "probe_hosts",
             ];
             for k in bw_obj.keys() {
                 if !allowed_bw_keys.contains(&k.as_str()) {
@@ -611,6 +657,41 @@ impl PolicyConfig {
                 .get("query_param_strip_enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let rewrite_scope = match bw_obj.get("rewrite_scope") {
+                None => RewriteScope::HostScoped,
+                Some(v) => {
+                    let raw = v.as_str().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "body_rewrite.rewrite_scope must be a string",
+                        )
+                    })?;
+                    RewriteScope::parse_config_value(raw).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid body_rewrite.rewrite_scope: '{raw}' \
+                                 (expected \"host_scoped\" or \"global\")"
+                            ),
+                        )
+                    })?
+                }
+            };
+            let mut probe_hosts = HashSet::new();
+            if let Some(arr) = bw_obj.get("probe_hosts").and_then(|v| v.as_array()) {
+                for entry in arr {
+                    let raw = entry.as_str().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "body_rewrite.probe_hosts must contain only strings",
+                        )
+                    })?;
+                    let normalized = normalize_host(raw);
+                    if !normalized.is_empty() {
+                        probe_hosts.insert(normalized);
+                    }
+                }
+            }
             BodyRewriteRule {
                 enabled: bw_enabled,
                 tracker_script_patterns,
@@ -620,6 +701,8 @@ impl PolicyConfig {
                 max_body_bytes,
                 referer_spoof_domains,
                 query_param_strip_enabled,
+                rewrite_scope,
+                probe_hosts,
             }
         } else {
             BodyRewriteRule::default()
@@ -856,6 +939,8 @@ impl PolicyConfig {
             },
             consent_analytics_domain_count: self.consent_enforcement.analytics_domains.len(),
             consent_user_profile_count: self.consent_enforcement.user_profiles.len(),
+            body_rewrite_scope: self.body_rewrite.rewrite_scope.as_str(),
+            body_rewrite_probe_host_count: self.body_rewrite.probe_hosts.len(),
         }
     }
 }
@@ -872,6 +957,8 @@ pub struct PolicyConfigSummary {
     pub consent_default_consent: &'static str,
     pub consent_analytics_domain_count: usize,
     pub consent_user_profile_count: usize,
+    pub body_rewrite_scope: &'static str,
+    pub body_rewrite_probe_host_count: usize,
 }
 
 #[derive(Debug)]
@@ -931,6 +1018,8 @@ impl PolicyEngine {
                 consent_default_consent: "disabled",
                 consent_analytics_domain_count: 0,
                 consent_user_profile_count: 0,
+                body_rewrite_scope: RewriteScope::HostScoped.as_str(),
+                body_rewrite_probe_host_count: 0,
             })
     }
 
@@ -947,6 +1036,30 @@ impl PolicyEngine {
             .map_err(|e| io::Error::other(format!("policy config lock poisoned: {e}")))?;
         *guard = cfg;
         Ok(summary)
+    }
+
+    /// True when the host is in the tracker/consent advertising sets: the manual
+    /// tracker list or the filter-list block list (minus exceptions).
+    ///
+    /// Shared by `plan_for_host` and `plan_for_body_rewrite` so the "is this an
+    /// advertising host" question has exactly one implementation.
+    fn is_advertising_host(&self, normalized: &str, cfg: &PolicyConfig) -> bool {
+        if cfg.mode == PolicyMode::Disabled {
+            return false;
+        }
+        if cfg.tracker_set_cookie.enabled
+            && domain_in_set_or_parent(normalized, &cfg.tracker_set_cookie.domains)
+        {
+            return true;
+        }
+        if let Ok(fl) = self.filter_list_rules.read() {
+            if domain_in_set_or_parent(normalized, &fl.block_domains)
+                && !domain_in_set_or_parent(normalized, &fl.exception_domains)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn plan_for_host(&self, host: &str) -> SessionPlan {
@@ -975,21 +1088,7 @@ impl PolicyEngine {
         let consent_active = cfg_guard.consent_enforcement.enabled && mode != PolicyMode::Disabled;
 
         // Determine if domain is in advertising lists (tracker_set_cookie + filter list)
-        let mut is_advertising =
-            if cfg_guard.tracker_set_cookie.enabled && mode != PolicyMode::Disabled {
-                domain_in_set_or_parent(&normalized, &cfg_guard.tracker_set_cookie.domains)
-            } else {
-                false
-            };
-        if !is_advertising && mode != PolicyMode::Disabled {
-            if let Ok(fl) = self.filter_list_rules.read() {
-                if domain_in_set_or_parent(&normalized, &fl.block_domains)
-                    && !domain_in_set_or_parent(&normalized, &fl.exception_domains)
-                {
-                    is_advertising = true;
-                }
-            }
-        }
+        let is_advertising = self.is_advertising_host(&normalized, &cfg_guard);
 
         // Determine if domain is in analytics list
         let is_analytics = consent_active
@@ -1121,7 +1220,28 @@ impl PolicyEngine {
         }
     }
 
+    /// Test-only conservative shorthand: no receipt history is consulted, so
+    /// `productive` is false.
+    ///
+    /// Deliberately not available outside `#[cfg(test)]`: a production caller
+    /// must pass its receipt evidence explicitly, because silently defaulting
+    /// to `false` would strip rewriting from hosts that earned it.
+    #[cfg(test)]
     pub fn plan_for_body_rewrite(&self, host: &str) -> BodyRewritePlan {
+        self.plan_for_body_rewrite_with_productivity(host, false)
+    }
+
+    /// Plans a body rewrite, treating `productive` as the recorded evidence
+    /// that this host has previously had elements removed by rewriting.
+    ///
+    /// `productive` must come from durable receipt history; passing `false`
+    /// (cold start, or no receipts file) is the conservative direction and
+    /// means only the static host-keyed rules can enable rewriting.
+    pub fn plan_for_body_rewrite_with_productivity(
+        &self,
+        host: &str,
+        productive: bool,
+    ) -> BodyRewritePlan {
         let normalized = normalize_host(host);
         let cfg_guard = match self.cfg.read() {
             Ok(g) => g,
@@ -1190,15 +1310,10 @@ impl PolicyEngine {
             empty_string_vec_arc()
         };
 
-        let should_rewrite = mode != PolicyMode::Disabled
-            && (strip_tracking_pixels
-                || !manual_script_patterns.is_empty()
-                || !filter_script_patterns.is_empty()
-                || !manual_remove_selectors.is_empty()
-                || !filter_remove_selectors.is_empty()
-                || !domain_remove_selectors.is_empty()
-                || !css_inject_selectors.is_empty());
-
+        // Computed before `should_rewrite` because two of the host-scoped arms
+        // are exactly these flags: Referer spoofing and query-parameter
+        // stripping are applied inside the HTTP/1.1 relay, so a host that needs
+        // them needs `should_rewrite` to be true or the relay is never entered.
         let referer_spoof = mode != PolicyMode::Disabled
             && cfg_guard.body_rewrite.enabled
             && !cfg_guard.body_rewrite.referer_spoof_domains.is_empty()
@@ -1207,6 +1322,63 @@ impl PolicyEngine {
         let query_param_strip = mode != PolicyMode::Disabled
             && cfg_guard.body_rewrite.enabled
             && cfg_guard.body_rewrite.query_param_strip_enabled;
+
+        // Consent/tracker hosts: mirrors `SessionPlan::tracker_match`
+        // (advertising or analytics). It is a superset of
+        // `enable_http1_set_cookie_filter`, which additionally skips users who
+        // consented to everything; this plan has no source IP, so it cannot
+        // resolve per-user consent and errs toward the host-level answer.
+        let is_analytics = cfg_guard.consent_enforcement.enabled
+            && mode != PolicyMode::Disabled
+            && domain_in_set_or_parent(
+                &normalized,
+                &cfg_guard.consent_enforcement.analytics_domains,
+            );
+        let consent_or_tracker = is_analytics || self.is_advertising_host(&normalized, &cfg_guard);
+
+        let probe_open = cfg_guard.body_rewrite.enabled
+            && !cfg_guard.body_rewrite.probe_hosts.is_empty()
+            && domain_in_set_or_parent(&normalized, &cfg_guard.body_rewrite.probe_hosts);
+
+        let legacy_global_should_rewrite = mode != PolicyMode::Disabled
+            && (strip_tracking_pixels
+                || !manual_script_patterns.is_empty()
+                || !filter_script_patterns.is_empty()
+                || !manual_remove_selectors.is_empty()
+                || !filter_remove_selectors.is_empty()
+                || !domain_remove_selectors.is_empty()
+                || !css_inject_selectors.is_empty());
+
+        // Host-scoped arms, in the order they were derived: a configured
+        // Referer spoof, domain-scoped cosmetic rules from the filter lists, a
+        // consent/tracker Set-Cookie match, recorded evidence of a past
+        // removal, or an operator-nominated probe.
+        //
+        // The last two are what make this more than a static allowlist:
+        // `productive` is earned permanently by removing something once, and
+        // `probe_open` is how a host with no static rule gets its first chance.
+        //
+        // Note there is deliberately no `body_rewrite.enabled` gate here, and no
+        // gate on the *global* selector sets (`filter_remove_selectors`,
+        // `filter_script_patterns`, `strip_tracking_pixels`). Those arms are
+        // exactly the host-independent constants this change exists to remove;
+        // each one is host-blind, so any of them here would make the predicate
+        // true for every host again. The arms that already required
+        // `body_rewrite.enabled` (manual patterns, Referer spoof, probes) keep
+        // that requirement, and the filter-list arms keep their existing
+        // `mode != Disabled` gate. Host-scoping is the only intended change.
+        let host_scoped_should_rewrite = referer_spoof
+            || !domain_remove_selectors.is_empty()
+            || consent_or_tracker
+            || productive
+            || probe_open;
+
+        let should_rewrite = match cfg_guard.body_rewrite.rewrite_scope {
+            RewriteScope::Global => legacy_global_should_rewrite,
+            RewriteScope::HostScoped => {
+                mode != PolicyMode::Disabled && host_scoped_should_rewrite
+            }
+        };
 
         BodyRewritePlan {
             mode,
@@ -1731,14 +1903,33 @@ mod tests {
             &[".ad-banner"],
         ));
 
+        // Manual and filter-list patterns are both still collected...
         let plan = engine.plan_for_body_rewrite("example.com");
-        assert!(plan.should_rewrite);
         assert!(plan
             .script_patterns_iter()
             .any(|p| p == "googletagmanager.com"));
         assert!(plan.script_patterns_iter().any(|p| p == "/tracking.js"));
         assert!(plan.remove_selectors_iter().any(|s| s == ".manual-ad"));
         assert!(plan.remove_selectors_iter().any(|s| s == ".ad-banner"));
+
+        // ...but collecting them no longer forces a rewrite of every host: the
+        // global sets are host-blind, so a host with no host-keyed rule is not
+        // rewritten even though the sets are non-empty.
+        assert!(
+            !plan.should_rewrite,
+            "a host with only global (host-blind) rules must not be rewritten"
+        );
+
+        // A host-keyed rule flips it, and the global sets then still apply.
+        let mut rules = make_filter_list_rules(&[], &[], &["/tracking.js"], &[".ad-banner"]);
+        rules.domain_cosmetic_map.insert(
+            "example.com".to_string(),
+            Arc::new(vec![".sidebar-ad".to_string()]),
+        );
+        engine.replace_filter_list_rules(rules);
+        let keyed = engine.plan_for_body_rewrite("example.com");
+        assert!(keyed.should_rewrite);
+        assert!(keyed.remove_selectors_iter().any(|s| s == ".manual-ad"));
     }
 
     #[test]
@@ -1751,12 +1942,16 @@ mod tests {
             &[".ad-banner"],
         ));
 
+        // The global filter-list sets are carried in the plan...
         let plan = engine.plan_for_body_rewrite("example.com");
-        assert!(plan.should_rewrite);
         let patterns: Vec<&str> = plan.script_patterns_iter().collect();
         assert_eq!(patterns, vec!["/tracking.js"]);
         let selectors: Vec<&str> = plan.remove_selectors_iter().collect();
         assert_eq!(selectors, vec![".ad-banner"]);
+
+        // ...but they are host-blind, so they do not by themselves make this
+        // host worth an HTTP/1.1 connection.
+        assert!(!plan.should_rewrite);
     }
 
     #[test]
@@ -1791,6 +1986,278 @@ mod tests {
         // Unrelated domain should not get the selector
         let plan2 = engine.plan_for_body_rewrite("other.com");
         assert!(!plan2.remove_selectors_iter().any(|s| s == ".sidebar-ad"));
+        assert!(
+            !plan2.should_rewrite,
+            "an unrelated host must not inherit another host's rule"
+        );
+    }
+
+    // --- Host-scoped rewrite predicate -------------------------------------
+    //
+    // Mirrors the live policy: `strip_tracking_pixels` true and non-empty
+    // manual patterns/selectors. Under the old predicate those host-blind arms
+    // made `should_rewrite` true for every host, which forced HTTP/1.1 on the
+    // whole probe (measured: 24 hosts ever rewritten, 1 ever removed anything).
+
+    fn host_scoped_engine(name: &str) -> PolicyEngine {
+        let path = temp_file(name);
+        write(
+            &path,
+            r#"{
+              "version": 1,
+              "mode": "enforce",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "consent_enforcement": {
+                  "enabled": true,
+                  "default_consent": "essential_only",
+                  "analytics_domains": ["google-analytics.com"]
+                },
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["googletagmanager.com"],
+                  "remove_selectors": [".manual-ad"],
+                  "strip_tracking_pixels": true,
+                  "referer_spoof_domains": ["nytimes.com"],
+                  "query_param_strip_enabled": true,
+                  "probe_hosts": ["probe.example"]
+                }
+              }
+            }"#,
+        );
+        PolicyEngine::load_from_file(&path, None).expect("load")
+    }
+
+    #[test]
+    fn global_arms_alone_do_not_rewrite_every_host() {
+        let engine = host_scoped_engine("predicate_cold_start");
+        engine.replace_filter_list_rules(make_filter_list_rules(
+            &[],
+            &[],
+            &["/tracking.js"],
+            &[".ad-banner"],
+        ));
+
+        // The plan still carries the global sets...
+        let plan = engine.plan_for_body_rewrite_with_productivity("example.com", false);
+        assert!(plan.strip_tracking_pixels);
+        assert!(!plan.manual_remove_selectors.is_empty());
+        assert!(plan
+            .script_patterns_iter()
+            .any(|p| p == "googletagmanager.com"));
+
+        // ...but with no receipt history and no host-keyed rule, this host is
+        // not worth an HTTP/1.1 connection. This is the cold-start contract:
+        // conservative, not permissive.
+        assert!(
+            !plan.should_rewrite,
+            "global (host-blind) arms must not force a rewrite of every host"
+        );
+        assert!(!plan.referer_spoof);
+    }
+
+    #[test]
+    fn recorded_removal_enables_rewriting() {
+        let engine = host_scoped_engine("predicate_productive");
+
+        let cold = engine.plan_for_body_rewrite_with_productivity("example.com", false);
+        assert!(!cold.should_rewrite);
+
+        let earned = engine.plan_for_body_rewrite_with_productivity("example.com", true);
+        assert!(
+            earned.should_rewrite,
+            "a host with a recorded removal must stay rewritten"
+        );
+        assert!(!earned.referer_spoof);
+    }
+
+    #[test]
+    fn referer_spoof_host_is_rewritten() {
+        let engine = host_scoped_engine("predicate_referer");
+
+        // The Referer rewrite is applied inside the HTTP/1.1 relay, so this
+        // host must keep `should_rewrite` or it silently loses spoofing.
+        let plan = engine.plan_for_body_rewrite_with_productivity("www.nytimes.com", false);
+        assert!(plan.referer_spoof);
+        assert!(plan.should_rewrite);
+
+        // Subdomain matching follows the parent walk.
+        let sub = engine.plan_for_body_rewrite_with_productivity("www.nytimes.com", false);
+        assert!(sub.should_rewrite);
+    }
+
+    #[test]
+    fn consent_and_tracker_hosts_are_rewritten() {
+        let engine = host_scoped_engine("predicate_consent");
+
+        // Advertising category (manual tracker list).
+        let ad = engine.plan_for_body_rewrite_with_productivity("doubleclick.net", false);
+        assert!(ad.should_rewrite);
+        assert!(engine.plan_for_host("doubleclick.net").tracker_match);
+
+        // Analytics category (consent enforcement list).
+        let analytics =
+            engine.plan_for_body_rewrite_with_productivity("stats.google-analytics.com", false);
+        assert!(analytics.should_rewrite);
+    }
+
+    #[test]
+    fn probe_host_is_rewritten_then_earns_productivity() {
+        let engine = host_scoped_engine("predicate_probe");
+
+        let probed = engine.plan_for_body_rewrite_with_productivity("probe.example", false);
+        assert!(probed.should_rewrite, "probe hosts get a first chance");
+
+        // A host that is not probed and has no rule still gets nothing.
+        let other = engine.plan_for_body_rewrite_with_productivity("other.example", false);
+        assert!(!other.should_rewrite);
+    }
+
+    #[test]
+    fn global_scope_restores_the_legacy_predicate() {
+        let path = temp_file("predicate_global_scope");
+        write(
+            &path,
+            r#"{
+              "version": 1,
+              "mode": "enforce",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["googletagmanager.com"],
+                  "remove_selectors": [],
+                  "strip_tracking_pixels": false,
+                  "rewrite_scope": "global"
+                }
+              }
+            }"#,
+        );
+        let engine = PolicyEngine::load_from_file(&path, None).expect("load");
+        assert_eq!(engine.summary().body_rewrite_scope, "global");
+
+        // Revert path: any host is rewritten again, including a host with no
+        // host-keyed rule and no history.
+        let plan = engine.plan_for_body_rewrite_with_productivity("example.com", false);
+        assert!(plan.should_rewrite);
+        let other = engine.plan_for_body_rewrite_with_productivity("nowhere.invalid", false);
+        assert!(other.should_rewrite);
+    }
+
+    #[test]
+    fn rewrite_scope_defaults_to_host_scoped() {
+        let path = temp_file("predicate_default_scope");
+        write(
+            &path,
+            r#"{
+              "version": 1,
+              "mode": "enforce",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["googletagmanager.com"],
+                  "strip_tracking_pixels": false
+                }
+              }
+            }"#,
+        );
+        let engine = PolicyEngine::load_from_file(&path, None).expect("load");
+        assert_eq!(engine.summary().body_rewrite_scope, "host_scoped");
+        assert_eq!(engine.summary().body_rewrite_probe_host_count, 0);
+    }
+
+    #[tokio::test]
+    async fn shipped_policy_config_is_not_host_blind() {
+        // Exercises the config the engine actually runs (see
+        // configs/easylist.local.json) together with the real filter-list
+        // parser. `state/easylist.txt` is gitignored, so the list itself is
+        // synthetic here; what is under test is the shipped policy config
+        // composed with real parsed rules.
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/policy_full.json");
+        assert!(
+            policy_path.exists(),
+            "shipped policy config missing at {}; this test must not silently pass",
+            policy_path.display()
+        );
+        let engine = PolicyEngine::load_from_file(&policy_path, None).expect("shipped policy");
+        assert_eq!(
+            engine.summary().body_rewrite_scope,
+            "host_scoped",
+            "the shipped config must not fall back to the host-blind predicate"
+        );
+
+        // Domain-scoped cosmetic rules for one of the hosts that was measured
+        // to have removed elements, and a global-only rule set so the
+        // host-blind arms are definitely populated.
+        let list_path = temp_file("shipped_easylist");
+        write(
+            &list_path,
+            "##.global-banner\n\
+             www.reddit.com##.promoted\n\
+             nytimes.com##.paywall-overlay\n",
+        );
+        let rules = crate::filter_list::refresh_filter_lists(
+            &[crate::filter_list::FilterListSource::local_file(
+                list_path.display().to_string(),
+            )],
+            &std::env::temp_dir().join("shipped_easylist_cache"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("parse synthetic list");
+        assert!(
+            !rules.domain_cosmetic_map.is_empty() && !rules.cosmetic_selectors.is_empty(),
+            "fixture must populate both host-keyed and host-blind rule sets"
+        );
+        engine.replace_filter_list_rules(rules);
+
+        // A host that was rewritten across the probe and removed nothing stays
+        // off the rewrite path, so it can negotiate HTTP/2 again.
+        for host in ["example.com", "www.wikipedia.org"] {
+            let plan = engine.plan_for_body_rewrite_with_productivity(host, false);
+            assert!(
+                !plan.should_rewrite,
+                "{host} has no host-keyed rule and no recorded removal"
+            );
+        }
+
+        // The host with a domain-scoped rule keeps rewriting.
+        let reddit = engine.plan_for_body_rewrite_with_productivity("www.reddit.com", false);
+        assert!(
+            reddit.should_rewrite,
+            "www.reddit.com has domain-scoped rules and must keep rewriting"
+        );
+
+        // A Referer-spoof host keeps rewriting: the spoof is applied inside the
+        // HTTP/1.1 relay, so losing `should_rewrite` would silently drop it.
+        let nyt = engine.plan_for_body_rewrite_with_productivity("www.nytimes.com", false);
+        assert!(nyt.referer_spoof);
+        assert!(nyt.should_rewrite);
+    }
+
+    #[test]
+    fn invalid_rewrite_scope_is_rejected() {
+        let path = temp_file("predicate_bad_scope");
+        write(
+            &path,
+            r#"{
+              "version": 1,
+              "mode": "enforce",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["x"],
+                  "strip_tracking_pixels": false,
+                  "rewrite_scope": "sometimes"
+                }
+              }
+            }"#,
+        );
+        let err = PolicyEngine::load_from_file(&path, None)
+            .expect_err("invalid scope must be rejected");
+        assert!(err.to_string().contains("rewrite_scope"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufWriter};
@@ -7,6 +7,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Upper bound on retained productive-host entries.
+///
+/// Measured on the live proxy: 1 host of 241 ever recorded a removal, so this is
+/// far above observed cardinality. On overflow new entries are refused (with a
+/// warning) rather than evicting existing ones: forgetting a productive host
+/// costs it its rewrite, and it cannot re-earn the status if it is not rewritten.
+const MAX_PRODUCTIVE_HOSTS: usize = 4096;
+
+/// Top-level receipts-file key holding hosts that have ever demonstrated a
+/// removal. Deliberately stored outside the per-host map, which is pruned after
+/// 6 hours of inactivity by `prune_stale_hosts`.
+const PRODUCTIVE_HOSTS_KEY: &str = "productive_hosts";
 
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
@@ -256,9 +269,14 @@ fn persist_receipts(path: &Path, json: &Value) -> io::Result<()> {
     Ok(())
 }
 
-fn load_receipts(path: &Path) -> io::Result<HashMap<String, HostReceipt>> {
+/// Loads both the per-host counters and the durable productive-host set.
+///
+/// The productive set is stored outside the `hosts` map because `prune_stale_hosts`
+/// drops any host unseen for 6 hours; productivity must outlive that pruning or a
+/// host could never re-earn it (rewriting is what produces the evidence).
+fn load_receipts_file(path: &Path) -> io::Result<(HashMap<String, HostReceipt>, HashSet<String>)> {
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashSet::new()));
     }
 
     let raw = fs::read_to_string(path)?;
@@ -278,13 +296,32 @@ fn load_receipts(path: &Path) -> io::Result<HashMap<String, HostReceipt>> {
 
     let mut out = HashMap::new();
     for (host, v) in hosts_obj {
+        // Guard the legacy root-as-hosts fallback against the sibling key.
+        if host == PRODUCTIVE_HOSTS_KEY {
+            continue;
+        }
         let normalized = normalize_host(host);
         if normalized.is_empty() {
             continue;
         }
         out.insert(normalized, HostReceipt::from_json(v));
     }
-    Ok(out)
+
+    // Absent key = no history yet (cold start or a pre-existing file); that
+    // resolves to "no host is productive", which is the conservative direction.
+    let mut productive = HashSet::new();
+    if let Some(arr) = parsed.get(PRODUCTIVE_HOSTS_KEY).and_then(|v| v.as_array()) {
+        for entry in arr {
+            if let Some(host) = entry.as_str() {
+                let normalized = normalize_host(host);
+                if !normalized.is_empty() {
+                    productive.insert(normalized);
+                }
+            }
+        }
+    }
+
+    Ok((out, productive))
 }
 
 #[derive(Debug)]
@@ -1411,6 +1448,9 @@ pub fn render_compliance_report_html(
 pub struct ReceiptStore {
     path: PathBuf,
     hosts: RwLock<HashMap<String, HostReceipt>>,
+    /// Hosts that have ever recorded at least one element removal during a body
+    /// rewrite. Durable: never pruned, persisted alongside the host counters.
+    productive_hosts: RwLock<HashSet<String>>,
     dirty: AtomicBool,
 }
 
@@ -1425,10 +1465,26 @@ pub struct BodyRewriteDetails {
 
 impl ReceiptStore {
     pub fn load(path: &Path) -> io::Result<Self> {
+        let (hosts, mut productive_hosts) = load_receipts_file(path)?;
+
+        // Seed the durable set from counters written before it existed, so hosts
+        // that already earned rewriting keep it across the upgrade instead of
+        // starting from an empty set.
+        let mut seeded = false;
+        for (host, receipt) in &hosts {
+            if receipt.body_rewrite_removed_script_total > 0
+                || receipt.body_rewrite_removed_pixel_total > 0
+                || receipt.body_rewrite_removed_cosmetic_total > 0
+            {
+                seeded |= productive_hosts.insert(host.clone());
+            }
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
-            hosts: RwLock::new(load_receipts(path)?),
-            dirty: AtomicBool::new(false),
+            hosts: RwLock::new(hosts),
+            productive_hosts: RwLock::new(productive_hosts),
+            dirty: AtomicBool::new(seeded),
         })
     }
 
@@ -1551,7 +1607,59 @@ impl ReceiptStore {
         });
     }
 
+    /// Whether this host has ever demonstrated that body rewriting removes
+    /// something on it.
+    ///
+    /// Only `enforce`-mode rewrites count: report-only rewrites did not change
+    /// the page, so they are not evidence that rewriting is worthwhile.
+    pub fn is_productive(&self, host: &str) -> bool {
+        let normalized = normalize_host(host);
+        if normalized.is_empty() {
+            return false;
+        }
+        match self.productive_hosts.read() {
+            Ok(guard) => guard.contains(&normalized),
+            Err(_) => false,
+        }
+    }
+
+    /// Records that a host produced removals. Durable and idempotent.
+    fn mark_productive(&self, host: &str) {
+        let normalized = normalize_host(host);
+        if normalized.is_empty() {
+            return;
+        }
+        match self.productive_hosts.write() {
+            Ok(mut guard) => {
+                if guard.contains(&normalized) {
+                    return;
+                }
+                if guard.len() >= MAX_PRODUCTIVE_HOSTS {
+                    tracing::warn!(
+                        event = "productive_hosts_cap_reached",
+                        host = %normalized,
+                        cap = MAX_PRODUCTIVE_HOSTS,
+                        "refusing new productive-host entry; existing entries are retained"
+                    );
+                    return;
+                }
+                guard.insert(normalized);
+                self.dirty.store(true, Ordering::Release);
+            }
+            Err(_) => {
+                // Telemetry must not crash the proxy; the lock poison surfaces on flush.
+            }
+        }
+    }
+
     pub fn record_body_rewrite(&self, host: &str, mode: &str, details: BodyRewriteDetails) {
+        if mode == "enforce"
+            && (details.removed_scripts > 0
+                || details.removed_pixels > 0
+                || details.removed_cosmetic > 0)
+        {
+            self.mark_productive(host);
+        }
         self.inc_counter(host, |r| match mode {
             "enforce" => {
                 r.body_rewrite_total = r.body_rewrite_total.saturating_add(1);
@@ -1689,7 +1797,11 @@ impl ReceiptStore {
             return Ok(false);
         }
 
-        // Prune stale hosts (older than 6 hours) under write lock
+        // Prune stale hosts (older than 6 hours) under write lock.
+        //
+        // This deliberately does NOT touch `productive_hosts`: pruning a host's
+        // counters must not erase the fact that it once demonstrated a removal,
+        // because a host that is not rewritten can never re-earn that status.
         {
             if let Ok(mut guard) = self.hosts.write() {
                 prune_stale_hosts(&mut guard, 6 * 3600);
@@ -1697,6 +1809,11 @@ impl ReceiptStore {
         }
 
         let snapshot = self.hosts.read().map_err(lock_error)?.clone();
+        let mut productive: Vec<String> = match self.productive_hosts.read() {
+            Ok(guard) => guard.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+        productive.sort();
 
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -1705,11 +1822,14 @@ impl ReceiptStore {
                 hosts_json.insert(host, receipt.as_json());
             }
 
-            let root = json!({
+            let mut root = json!({
                 "version": 1,
                 "generated_unix": now_unix_seconds(),
                 "hosts": Value::Object(hosts_json),
             });
+            if let Value::Object(map) = &mut root {
+                map.insert(PRODUCTIVE_HOSTS_KEY.to_string(), json!(productive));
+            }
 
             if let Err(e) = persist_receipts(&path, &root) {
                 tracing::warn!(event = "receipts_flush_error", error = %e);
@@ -1870,8 +1990,131 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Reload and verify
-        let loaded = load_receipts(&path).expect("reload");
+        let (loaded, _productive) = load_receipts_file(&path).expect("reload");
         assert!(loaded.contains_key("fresh.com"));
         assert!(!loaded.contains_key("stale.com"));
+    }
+
+    #[tokio::test]
+    async fn removals_mark_host_productive() {
+        let path = temp_file("receipts_productive");
+        let store = ReceiptStore::load(&path).expect("load");
+        assert!(!store.is_productive("example.com"));
+
+        // A rewrite that removed nothing is not evidence.
+        store.record_body_rewrite(
+            "example.com",
+            "enforce",
+            BodyRewriteDetails {
+                removed_scripts: 0,
+                removed_pixels: 0,
+                removed_cosmetic: 0,
+                bytes_saved: 0,
+                bytes_injected: 512,
+            },
+        );
+        assert!(!store.is_productive("example.com"));
+
+        // Report-only removals are not evidence either: the page was unchanged.
+        store.record_body_rewrite(
+            "example.com",
+            "report_only",
+            BodyRewriteDetails {
+                removed_cosmetic: 3,
+                ..BodyRewriteDetails::default()
+            },
+        );
+        assert!(!store.is_productive("example.com"));
+
+        // An enforced removal is.
+        store.record_body_rewrite(
+            "example.com",
+            "enforce",
+            BodyRewriteDetails {
+                removed_cosmetic: 1,
+                ..BodyRewriteDetails::default()
+            },
+        );
+        assert!(store.is_productive("example.com"));
+        assert!(store.is_productive("EXAMPLE.COM."), "host is normalized");
+    }
+
+    #[tokio::test]
+    async fn productive_hosts_survive_pruning_and_reload() {
+        let path = temp_file("receipts_productive_durable");
+        let store = ReceiptStore::load(&path).expect("load");
+
+        store.record_body_rewrite(
+            "www.reddit.com",
+            "enforce",
+            BodyRewriteDetails {
+                removed_cosmetic: 8,
+                ..BodyRewriteDetails::default()
+            },
+        );
+
+        // Age the host past the 6h prune window that flush_if_dirty applies.
+        {
+            let mut guard = store.hosts.write().expect("write lock");
+            let entry = guard.entry("www.reddit.com".to_string()).or_default();
+            entry.last_seen_unix = now_unix_seconds() - (7 * 3600);
+            store.dirty.store(true, Ordering::Relaxed);
+        }
+
+        assert!(store.flush_if_dirty().expect("flush"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (hosts, productive) = load_receipts_file(&path).expect("reload");
+        assert!(
+            !hosts.contains_key("www.reddit.com"),
+            "stale counters are pruned"
+        );
+        assert!(
+            productive.contains("www.reddit.com"),
+            "productivity must outlive counter pruning, or the host can never re-earn it"
+        );
+
+        let reloaded = ReceiptStore::load(&path).expect("reload store");
+        assert!(reloaded.is_productive("www.reddit.com"));
+    }
+
+    #[test]
+    fn cold_start_has_no_productive_hosts() {
+        let path = temp_file("receipts_cold_start");
+        let store = ReceiptStore::load(&path).expect("load");
+        assert!(!store.is_productive("www.reddit.com"));
+        assert!(!store.is_productive("example.com"));
+    }
+
+    #[tokio::test]
+    async fn productive_hosts_load_from_legacy_file_without_key() {
+        let path = temp_file("receipts_legacy");
+        // A file written before the productive_hosts key existed, whose host
+        // never removed anything: nothing is seeded.
+        fs::write(
+            &path,
+            r#"{"version":1,"generated_unix":1,"hosts":{"example.com":{"seen_total":3}}}"#,
+        )
+        .expect("write");
+        let store = ReceiptStore::load(&path).expect("load");
+        assert!(!store.is_productive("example.com"));
+    }
+
+    #[tokio::test]
+    async fn legacy_removal_counters_seed_productivity() {
+        let path = temp_file("receipts_legacy_seed");
+        // A file written before the productive_hosts key existed, whose host
+        // already recorded removals: that evidence must survive the upgrade.
+        fs::write(
+            &path,
+            r#"{"version":1,"generated_unix":1,"hosts":{
+                 "www.reddit.com":{"body_rewrite_total":171,"body_rewrite_removed_cosmetic_total":8},
+                 "idle.example":{"body_rewrite_total":12,"body_rewrite_removed_cosmetic_total":0}
+               }}"#,
+        )
+        .expect("write");
+        let store = ReceiptStore::load(&path).expect("load");
+        assert!(store.is_productive("www.reddit.com"));
+        assert!(!store.is_productive("idle.example"));
     }
 }

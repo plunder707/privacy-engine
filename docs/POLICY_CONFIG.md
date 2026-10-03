@@ -107,7 +107,11 @@ Effect:
   "tracker_script_patterns": ["googletagmanager.com/gtm.js", "google-analytics.com/analytics.js"],
   "remove_selectors": ["ins.adsbygoogle", "div[id^=\"google_ads\"]"],
   "strip_tracking_pixels": true,
-  "max_body_bytes": 2097152
+  "max_body_bytes": 2097152,
+  "referer_spoof_domains": ["nytimes.com"],
+  "query_param_strip_enabled": true,
+  "rewrite_scope": "host_scoped",
+  "probe_hosts": []
 }
 ```
 
@@ -116,6 +120,31 @@ Effect:
 - `remove_selectors` (optional): CSS selectors (validated at config parse time)
 - `strip_tracking_pixels` (optional): boolean (default false)
 - `max_body_bytes` (optional): integer (default 2 MiB)
+- `referer_spoof_domains` (optional): hosts whose `Referer` is normalized to a search-engine origin
+- `query_param_strip_enabled` (optional): boolean (default false), strips tracking query parameters
+- `rewrite_scope` (optional): `"host_scoped"` (default) or `"global"`
+- `probe_hosts` (optional): hosts allowed to be rewritten without prior evidence
+
+#### Rewrite scope
+
+Rewriting requires the HTTP/1.1 relay, so every rewritten host gives up HTTP/2
+multiplexing. `rewrite_scope` decides which hosts pay that cost:
+
+- `host_scoped` (default) rewrites a host only when it has a host-keyed reason:
+  a `referer_spoof_domains` match, domain-scoped filter-list cosmetic rules
+  (EasyList `domain##selector`), a tracker/consent match, a `probe_hosts`
+  entry, or recorded evidence that rewriting previously removed something on
+  that host. That last arm is durable: it is persisted in the receipts file
+  under `productive_hosts`, survives the 6-hour host-counter prune, and is
+  seeded from any pre-existing removal counters at load time.
+- `global` restores the previous host-blind behaviour, where any active
+  rewrite rule rewrites every host. Use it to revert without a rebuild.
+
+Because the global rule sets (EasyList) are host-blind, they no longer force a
+rewrite on their own; they are still applied in full to any host that is
+rewritten for one of the reasons above. On the live probe this kept rewriting
+on 53 of 241 receipt hosts and released 188 from HTTP/1.1, including 14 of the
+24 hosts that had previously been rewritten without removing anything.
 
 Effect:
 

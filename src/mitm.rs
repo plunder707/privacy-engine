@@ -312,10 +312,21 @@ impl MitmEngine {
         metrics: &metrics::Metrics,
     ) -> Result<(), MitmError> {
         let plan = policy_engine.plan_for_host_with_source_ip(target_host, source_ip);
-        let body_rewrite_plan = policy_engine.plan_for_body_rewrite(target_host);
-        let manual_rewrite_active = body_rewrite_plan.strip_tracking_pixels
-            || !body_rewrite_plan.manual_script_patterns.is_empty()
-            || !body_rewrite_plan.manual_remove_selectors.is_empty();
+        let body_rewrite_plan = policy_engine.plan_for_body_rewrite_with_productivity(
+            target_host,
+            host_is_productive(receipts_store, target_host),
+        );
+        // Manual rewrite config is host-blind: the live policy sets
+        // `strip_tracking_pixels` and dozens of manual patterns/selectors, so an
+        // unconditional read of these fields is true for every host and pins
+        // HTTP/1.1 on across the whole probe. Conjoin it with `should_rewrite`
+        // so manual config keeps its old precedence (it forces HTTP/1.1 even
+        // when `force_http1_for_filter_rewrite` is off) but only on hosts the
+        // host-scoped predicate actually selected.
+        let manual_rewrite_active = body_rewrite_plan.should_rewrite
+            && (body_rewrite_plan.strip_tracking_pixels
+                || !body_rewrite_plan.manual_script_patterns.is_empty()
+                || !body_rewrite_plan.manual_remove_selectors.is_empty());
         // Force HTTP/1.1 when we must (Set-Cookie policy), when the user configured
         // manual rewrite rules, or when any rewriting is planned at all and the
         // operator has opted into correctness over multiplexing.
@@ -706,7 +717,10 @@ where
                         }
 
                         // Referer header normalization for configured domains
-                        let bw_plan = policy_engine.plan_for_body_rewrite(target_host);
+                        let bw_plan = policy_engine.plan_for_body_rewrite_with_productivity(
+                            target_host,
+                            host_is_productive(receipts_store, target_host),
+                        );
                         let mut outgoing: Option<Vec<u8>> = None;
 
                         if bw_plan.referer_spoof {
@@ -1074,7 +1088,10 @@ where
                             .unwrap_or(&outcome.output_headers);
 
                         // Check if body rewrite should be attempted
-                        let bw_plan = policy_engine.plan_for_body_rewrite(target_host);
+                        let bw_plan = policy_engine.plan_for_body_rewrite_with_productivity(
+                            target_host,
+                            host_is_productive(receipts_store, target_host),
+                        );
                         let content_encoding = extract_content_encoding(output_headers);
                         let encoding_ok = match content_encoding.as_deref() {
                             None | Some("identity") => true,
@@ -1275,6 +1292,16 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|idx| idx + 4)
+}
+
+/// Whether durable receipt history shows this host has had elements removed by
+/// body rewriting before.
+///
+/// Absent receipt history (no store, cold start) yields `false`, which keeps
+/// the rewrite predicate conservative: only the static host-keyed rules can
+/// enable rewriting until a host has demonstrably earned it.
+fn host_is_productive(receipts_store: Option<&receipts::ReceiptStore>, host: &str) -> bool {
+    receipts_store.is_some_and(|store| store.is_productive(host))
 }
 
 fn response_is_html(header_block: &[u8]) -> bool {
@@ -2191,8 +2218,17 @@ mod tests {
         );
         let (mut upstream, _, _) = FlushGatedIo::new(response);
         let policy = policy::PolicyEngine::new(policy::PolicyMode::Enforce);
+        // The host needs a host-keyed reason to be rewritten: a global cosmetic
+        // selector alone is host-blind, so it no longer enables rewriting
+        // anywhere (see `plan_for_body_rewrite_with_productivity`).
+        let mut domain_cosmetic_map = std::collections::HashMap::new();
+        domain_cosmetic_map.insert(
+            "fixture.invalid".to_string(),
+            Arc::new(vec![".fixture-ad".to_string()]),
+        );
         let filter_rules = crate::filter_list::FilterListRules {
             cosmetic_selectors: Arc::new(vec![".fixture-ad".to_string()]),
+            domain_cosmetic_map,
             ..Default::default()
         };
         policy.replace_filter_list_rules(filter_rules);

@@ -136,3 +136,26 @@ The receipts schema is versioned (`version: 1`). The full field list is the JSON
     - `body_rewrite_removed_script_total`, `body_rewrite_removed_pixel_total`, `body_rewrite_removed_cosmetic_total`
     - `body_rewrite_bytes_saved_total`
   - and the report-only equivalents (`*_report_only_total`)
+
+## Durable `productive_hosts` Set
+
+Alongside the per-host map, the receipts file carries a top-level
+`productive_hosts` array: hosts that have ever removed at least one element
+during an enforced body rewrite.
+
+It is stored outside the `hosts` map deliberately. Per-host counters are pruned
+after 6 hours of inactivity, and a host that is not rewritten cannot generate
+new removal evidence, so pruning productivity with the counters would be a
+one-way ratchet out of rewriting. The set is:
+
+- appended to only when an `enforce`-mode rewrite removes at least one script,
+  pixel, or cosmetic element (report-only removals prove nothing: the page was
+  unchanged);
+- never pruned, and capped at 4096 entries (new entries are refused with a
+  warning at the cap rather than evicting existing ones);
+- seeded at load time from any pre-existing host counters that already show
+  removals, so hosts that earned rewriting before this key existed keep it.
+
+`rewrite_scope: "host_scoped"` reads this set to decide whether a host has
+earned its HTTP/1.1 rewrite. An absent key means no history, which resolves to
+"no host is productive" -- the conservative direction.

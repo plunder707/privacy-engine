@@ -356,6 +356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             consent_default_consent = s.consent_default_consent,
             consent_analytics_domain_count = s.consent_analytics_domain_count,
             consent_user_profile_count = s.consent_user_profile_count,
+            body_rewrite_scope = s.body_rewrite_scope,
+            body_rewrite_probe_host_count = s.body_rewrite_probe_host_count,
             "policy engine initialized"
         );
         engine
@@ -376,6 +378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             consent_default_consent = s.consent_default_consent,
             consent_analytics_domain_count = s.consent_analytics_domain_count,
             consent_user_profile_count = s.consent_user_profile_count,
+            body_rewrite_scope = s.body_rewrite_scope,
+            body_rewrite_probe_host_count = s.body_rewrite_probe_host_count,
             "policy engine initialized"
         );
         engine
