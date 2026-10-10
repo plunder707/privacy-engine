@@ -328,17 +328,17 @@ impl MitmEngine {
                 || !body_rewrite_plan.manual_script_patterns.is_empty()
                 || !body_rewrite_plan.manual_remove_selectors.is_empty());
         // Force HTTP/1.1 when we must (Set-Cookie policy), when the user configured
-        // manual rewrite rules, or when any rewriting is planned at all and the
-        // operator has opted into correctness over multiplexing.
+        // manual rewrite rules, or when the compatibility switch is enabled.
         //
-        // The last case matters: filter-list rules set should_rewrite without
-        // setting any manual pattern, so previously a policy with tens of
-        // thousands of active EasyList rules still negotiated h2 — and the
-        // HTTP/1.1 body parser then found no framing it understood and did
-        // nothing, silently, on every modern site.
-        let force_http1 = plan.enable_http1_set_cookie_filter
-            || manual_rewrite_active
-            || (self.force_http1_for_filter_rewrite && body_rewrite_plan.should_rewrite);
+        // The compatibility switch also covers cold hosts with no rewrite
+        // selection: an HTTP/1.1 client must not be paired with an HTTP/2
+        // upstream by the raw copy_bidirectional fallback.
+        let force_http1 = should_force_http1_for_session(
+            self.force_http1_for_filter_rewrite,
+            plan.enable_http1_set_cookie_filter,
+            manual_rewrite_active,
+            body_rewrite_plan.should_rewrite,
+        );
 
         // Probe upstream FIRST — if upstream TLS fails, we can fall back to passthrough
         // before touching the client's TLS handshake, so the browser never sees an error.
@@ -525,6 +525,23 @@ impl MitmEngine {
 
         Ok(server_config)
     }
+}
+
+fn should_force_http1_for_session(
+    force_http1_for_filter_rewrite: bool,
+    enable_http1_set_cookie_filter: bool,
+    manual_rewrite_active: bool,
+    body_rewrite_selected: bool,
+) -> bool {
+    enable_http1_set_cookie_filter
+        || manual_rewrite_active
+        // The client ALPN is negotiated after the upstream connection. If this
+        // compatibility switch is enabled, keep every MITM session on HTTP/1.1
+        // so an HTTP/1.1 client cannot fall into copy_bidirectional against an
+        // HTTP/2 upstream. The latter produced an immediate empty reply on
+        // host-scoped cold hosts, even when no body rewrite was selected.
+        || force_http1_for_filter_rewrite
+        || body_rewrite_selected
 }
 
 async fn write_completed_response<W>(
@@ -2286,6 +2303,13 @@ mod tests {
         let (response, snapshot) = run_keep_alive_rewrite_fixture(600_000, false).await;
         assert_complete_rewritten_response(&response);
         assert_eq!(snapshot.response_flush_completed_total, 1);
+    }
+
+    #[test]
+    fn http1_compatibility_covers_cold_host_empty_reply_path() {
+        assert!(should_force_http1_for_session(true, false, false, false));
+        assert!(!should_force_http1_for_session(false, false, false, false));
+        assert!(should_force_http1_for_session(false, false, false, true));
     }
 
     #[test]
