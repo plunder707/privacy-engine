@@ -310,6 +310,8 @@ impl MitmEngine {
         policy_engine: &policy::PolicyEngine,
         receipts_store: Option<&receipts::ReceiptStore>,
         metrics: &metrics::Metrics,
+        pinned_hosts: Option<&crate::host_store::PinnedHosts>,
+        auto_pin_tracker: Option<&crate::auto_pin::AutoPinTracker>,
     ) -> Result<(), MitmError> {
         let plan = policy_engine.plan_for_host_with_source_ip(target_host, source_ip);
         let body_rewrite_plan = policy_engine.plan_for_body_rewrite_with_productivity(
@@ -386,6 +388,51 @@ impl MitmEngine {
                             metrics.inc_cert_pin_violation_total();
                             if let Some(store) = receipts_store {
                                 store.record_cert_pin_violation(target_host);
+                            }
+                            if let (Some(pinned_hosts), Some(auto_pin_tracker)) =
+                                (pinned_hosts, auto_pin_tracker)
+                            {
+                                match auto_pin_tracker.observe(target_host) {
+                                    Ok(observation) if observation.should_pin => {
+                                        match pinned_hosts.add_and_persist(target_host) {
+                                            Ok(true) => {
+                                                metrics.inc_host_auto_pinned_total();
+                                                if let Some(store) = receipts_store {
+                                                    store.record_host_auto_pinned(target_host);
+                                                }
+                                                warn!(
+                                                    event = "host_auto_pinned",
+                                                    host = target_host,
+                                                    reason = "cert_pin_violation",
+                                                    failure_count = observation.failure_count,
+                                                    reject_threshold = auto_pin_tracker.threshold(),
+                                                    "added host to pinned list after repeated cert-pin violations"
+                                                );
+                                            }
+                                            Ok(false) => {}
+                                            Err(e) => warn!(
+                                                event = "host_auto_pin_persist_failed",
+                                                host = target_host,
+                                                error = %e,
+                                                "failed to persist host promoted by cert-pin violations"
+                                            ),
+                                        }
+                                    }
+                                    Ok(observation) => info!(
+                                        event = "host_auto_pin_pending",
+                                        host = target_host,
+                                        reject_type = "cert_pin_violation",
+                                        failure_count = observation.failure_count,
+                                        reject_threshold = auto_pin_tracker.threshold(),
+                                        "cert-pin violation observed; auto-pin threshold not yet reached"
+                                    ),
+                                    Err(e) => warn!(
+                                        event = "host_auto_pin_observe_failed",
+                                        host = target_host,
+                                        error = %e,
+                                        "failed to observe cert-pin violation for auto-pin"
+                                    ),
+                                }
                             }
                         }
                         Err(e) => {

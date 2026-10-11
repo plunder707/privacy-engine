@@ -1387,6 +1387,8 @@ async fn run_mitm_intercept(
             deps.policy_engine,
             deps.receipts_store,
             deps.metrics,
+            Some(deps.pinned_hosts),
+            Some(deps.auto_pin_tracker),
         )
         .await
     {

@@ -58,7 +58,11 @@ impl InterceptBypass {
         if BUILTIN_HOSTS.contains(&normalized.as_str()) {
             return Some(BypassReason::BuiltinLoopback);
         }
-        if self.configured_hosts.contains(&normalized) {
+        if self
+            .configured_hosts
+            .iter()
+            .any(|configured| host_matches_entry(&normalized, configured))
+        {
             return Some(BypassReason::ConfiguredHost);
         }
         let ip = normalized.parse::<IpAddr>().ok()?;
@@ -70,6 +74,13 @@ impl InterceptBypass {
             .any(|cidr| cidr.contains(&ip))
             .then_some(BypassReason::ConfiguredCidr)
     }
+}
+
+/// Match an exact hostname or one of its DNS subdomains.  The label boundary
+/// is intentional: `example.com` must not bypass `notexample.com`.
+fn host_matches_entry(host: &str, configured: &str) -> bool {
+    let configured = configured.strip_prefix("*.").unwrap_or(configured);
+    host == configured || host.ends_with(&format!(".{configured}"))
 }
 
 fn normalize_host(host: &str) -> String {
@@ -126,6 +137,25 @@ mod tests {
             Some(BypassReason::ConfiguredCidr)
         );
         assert_eq!(policy.reason_for_host("10.21.4.8"), None);
+    }
+
+    #[test]
+    fn configured_hosts_match_subdomains_with_label_boundary() {
+        let policy = InterceptBypass::new(&["example.com".to_string()], &[]).expect("policy");
+        assert_eq!(
+            policy.reason_for_host("api.example.com"),
+            Some(BypassReason::ConfiguredHost)
+        );
+        assert_eq!(policy.reason_for_host("notexample.com"), None);
+    }
+
+    #[test]
+    fn explicit_wildcard_is_accepted_and_normalized() {
+        let policy = InterceptBypass::new(&["*.Example.COM.".to_string()], &[]).expect("policy");
+        assert_eq!(
+            policy.reason_for_host("child.example.com"),
+            Some(BypassReason::ConfiguredHost)
+        );
     }
 
     #[test]
