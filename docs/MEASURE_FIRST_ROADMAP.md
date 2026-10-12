@@ -44,6 +44,33 @@ Replace the global enforce/report_only dichotomy with **per-rule graduation**:
 - It upgrades the product story too: "enforcement earned from your own traffic's evidence" is a
   materially different claim from "we shipped a blocklist."
 
+## Refinement (same day): rectify-first — blocking is the fallback, not the primitive
+
+Operator, sharpening the direction: *"blocking doesn't seem right either — we should be rectifying
+and researching and testing and experimenting and improving things; if something isn't working it
+needs to be improved and upgraded."*
+
+The response ladder becomes:
+
+1. **Observe** — receipts (the substrate; already live).
+2. **Rectify** — repair the traffic instead of denying it:
+   - *sanitize* (strip tracking parameters, forward the useful request — it succeeds, minus the payload),
+   - *neutralize* (serve a benign no-op in place of a tracker script — the page works, the tracker gets nothing),
+   - *uncloak* (CNAME-uncloak first-party trackers and surface them — the engine already counts
+     `dns_cname_uncloaked_total`),
+   - *negotiate* (consent flows answered/streamlined rather than the request blocked).
+   The engine already carries the machinery's seeds: `body_rewrite_*` counters and the rewrite path.
+3. **Research + experiment** — when rectification fails, investigate why (the ecology's own method:
+   read the upstream, build the repro, run the experiment, ship the fix forward).
+4. **Upgrade** — every incident ends in a capability improvement, not a new deny entry.
+5. **Block — last resort only**, for the provably-irreparable (active malice, exfiltration), and only
+   with receipts proving rectification was attempted and impossible. Denial becomes an *earned
+   exception*, never the default response.
+
+This is the same law the ecology runs on: a failing lane gets investigated and re-dispatched bounded,
+not banned; a stale lock gets healed by doctrine, not punished. The product should embody the house
+style: **repair-forward.**
+
 ## Status
 
 DESIGN DIRECTION ONLY (not implemented; no per-rule mode exists in the engine today — verified
