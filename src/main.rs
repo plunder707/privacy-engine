@@ -1423,9 +1423,9 @@ async fn run_mitm_intercept(
                     client_addr = %ctx.client_addr,
                     host = ctx.host,
                     target_addr = ctx.target_addr,
-                    outcome = "benign_peer_close",
-                    error = %e,
-                    "MITM relay closed normally"
+                    outcome = "peer_closed_without_tls_close_notify",
+                    relay_error = %e,
+                    "MITM relay ended after peer closed without TLS close_notify"
                 );
                 return Ok(());
             }

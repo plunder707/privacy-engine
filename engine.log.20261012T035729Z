@@ -1,0 +1,18 @@
+2026-10-12T03:57:25.367434Z  INFO privacy_engine_rust: policy engine initialized event="policy_engine_initialized" source="file" policy_config_file=docs/policy_full.json policy_version=1 policy_mode="enforce" tracker_set_cookie_enabled=true tracker_domain_count=42 dns_block_enabled=true dns_block_domain_count=24 consent_enforcement_enabled=true consent_default_consent="essential_only" consent_analytics_domain_count=13 consent_user_profile_count=0 body_rewrite_scope="host_scoped" body_rewrite_probe_host_count=0
+2026-10-12T03:57:25.369075Z  INFO privacy_engine_rust: policy config reloaded event="policy_reload_applied" policy_config_file=docs/policy_full.json policy_version=1 policy_mode="enforce" tracker_set_cookie_enabled=true tracker_domain_count=42 consent_enforcement_enabled=true consent_default_consent="essential_only" consent_user_profile_count=0
+2026-10-12T03:57:25.407601Z  INFO privacy_engine_rust::filter_list: parsed filter list source=state/easylist.txt kind="local_file" total_lines=83329 domain_blocks=54655 url_patterns=1791 cosmetic_global=13639 exceptions=260 skipped_unsupported=3351
+2026-10-12T03:57:25.420752Z  INFO privacy_engine_rust::filter_list: filter list rules aggregated source_count=1 block_domains=52445 tracker_script_patterns=1786 cosmetic_selectors=13639 domain_cosmetic_entries=4720 exception_domains=253
+2026-10-12T03:57:25.423013Z  INFO privacy_engine_rust: filter list rules loaded event="filter_list_loaded" cache_dir=filter_list_cache sources_loaded=1 total_lines=83329 domain_blocks=54655 url_patterns=1791 cosmetic_global=13639 cosmetic_domain_scoped=9355 exceptions=260 skipped_unsupported=3351 skipped_comments=278
+2026-10-12T03:57:25.423857Z  INFO privacy_engine_rust: filter list refresh task spawned event="filter_list_refresh_task_spawned" refresh_secs=86400
+2026-10-12T03:57:25.424252Z  INFO privacy_engine_rust: Loaded 1107 pinned hosts from state/pe_pinned_hosts.json
+2026-10-12T03:57:25.424258Z  INFO privacy_engine_rust: MITM never-intercept policy initialized event="intercept_bypass_initialized" builtin_loopback=true configured_hosts=99 configured_cidrs=0
+2026-10-12T03:57:25.424262Z  INFO privacy_engine_rust: TLS auto-pin learning initialized event="auto_pin_tracker_initialized" reject_threshold=2 reject_window_secs=300
+2026-10-12T03:57:25.426028Z  INFO privacy_engine_rust: privacy receipts enabled event="receipts_initialized" receipts_file=state/pe_receipts.json
+2026-10-12T03:57:25.426038Z  INFO privacy_engine_rust: MITM mode enabled for non-pinned TLS hosts tls_profile="chrome" tls_profile_details="Chrome-like: cipher order, named groups (X25519/P-256/P-384), EMS required, session tickets"
+2026-10-12T03:57:25.426055Z  INFO privacy_engine_rust: MITM certificate transparency log enabled cert_log_file=state/pe_cert_log.jsonl
+2026-10-12T03:57:25.430019Z  INFO privacy_engine_rust: TOFU cert pin database loaded cert_pin_file=state/pe_cert_pins.json pins=2465
+2026-10-12T03:57:25.431623Z  INFO privacy_engine_rust::mitm: loaded native OS root certificates event="native_certs_loaded" added=122
+2026-10-12T03:57:25.432327Z  INFO privacy_engine_rust::mitm: loaded native OS root certificates event="native_certs_loaded" added=122
+2026-10-12T03:57:25.432337Z  INFO privacy_engine_rust: MITM CA loaded from cert='certs/ca_cert.pem' key='certs/ca_key.pem'
+2026-10-12T03:57:25.432505Z  INFO privacy_engine_rust: Exported MITM CA certificate to certs/ca_cert_export.pem
+Error: Os { code: 98, kind: AddrInUse, message: "Address already in use" }

@@ -24,6 +24,25 @@ engine_pids() { pgrep -f "$PATTERN" 2>/dev/null || true; }
 echo "==> config: $CONFIG"
 python3 -m json.tool "$CONFIG" >/dev/null || { echo "config is not valid JSON; refusing to restart" >&2; exit 1; }
 
+# Preserve the previous generation before starting a new one.  The old `>`
+# redirection erased the only forensic record of the preceding run whenever a
+# planned restart happened.  Keep the active path stable for existing readers,
+# but archive its contents and append the new generation to a fresh file.
+if [[ -s "$LOG" ]]; then
+  LOG_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+  LOG_ARCHIVE="${LOG}.${LOG_STAMP}"
+  archive_seq=0
+  while [[ -e "$LOG_ARCHIVE" ]]; do
+    archive_seq=$((archive_seq + 1))
+    LOG_ARCHIVE="${LOG}.${LOG_STAMP}.${archive_seq}"
+  done
+  mv -- "$LOG" "$LOG_ARCHIVE" || {
+    echo "could not archive existing $LOG; refusing to restart" >&2
+    exit 1
+  }
+  echo "==> archived previous log: $LOG_ARCHIVE"
+fi
+
 # Build before stopping the current process. Rebuilding replaces the executable
 # and therefore drops any Linux file capabilities previously applied to it.
 cargo build --release || { echo "release build failed; existing engine left running" >&2; exit 1; }
@@ -55,8 +74,8 @@ else
   echo "==> no running engine"
 fi
 
-echo "==> starting (log: $LOG)"
-nohup setsid bash scripts/run_easylist_local.sh "$CONFIG" >"$LOG" 2>&1 </dev/null &
+echo "==> starting (log: $LOG; append mode)"
+nohup setsid bash scripts/run_easylist_local.sh "$CONFIG" >>"$LOG" 2>&1 </dev/null &
 
 for _ in $(seq 1 40); do
   sleep 0.25
