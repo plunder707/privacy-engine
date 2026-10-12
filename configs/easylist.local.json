@@ -114,7 +114,7 @@
   "mitm_ca_export_cert_file": "certs/ca_cert_export.pem",
   "tls_profile": "chrome",
   "policy_config_file": "docs/policy_full.json",
-  "policy_mode": "enforce",
+  "policy_mode": "report_only",
   "policy_reload_interval_secs": 5,
   "enable_dns_filter": true,
   "dns_listen_host": "127.0.0.1",
