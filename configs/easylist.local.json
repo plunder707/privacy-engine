@@ -105,7 +105,14 @@
     "api.palworldgame.com",
     "palworldgame.com",
     "storeedgefd.dsx.mp.microsoft.com",
-    "displaycatalog.mp.microsoft.com"
+    "displaycatalog.mp.microsoft.com",
+    "anthropic.com",
+    "openai.com",
+    "deepseek.com",
+    "qwencloudapi.com",
+    "generativelanguage.googleapis.com",
+    "aistudio.google.com",
+    "gemini.google.com"
   ],
   "enable_mitm": true,
   "mitm_ca_cert_file": "certs/ca_cert.pem",
