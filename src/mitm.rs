@@ -762,7 +762,7 @@ where
                                 );
                             }
                         }
-                        if plan.tracker_match && plan.websocket_blocking_enabled && request_has_websocket_upgrade(request_head) {
+                        if plan.mode == policy::PolicyMode::Enforce && plan.tracker_match && plan.websocket_blocking_enabled && request_has_websocket_upgrade(request_head) {
                             info!(
                                 event = "websocket_blocked",
                                 host = target_host,
@@ -787,7 +787,7 @@ where
                         );
                         let mut outgoing: Option<Vec<u8>> = None;
 
-                        if bw_plan.referer_spoof {
+                        if bw_plan.mode == policy::PolicyMode::Enforce && bw_plan.referer_spoof {
                             if let Some(modified) = inject_google_referer(request_head) {
                                 info!(
                                     event = "referer_spoofed",
@@ -803,7 +803,7 @@ where
                         }
 
                         // Query parameter stripping
-                        if bw_plan.query_param_strip {
+                        if bw_plan.mode == policy::PolicyMode::Enforce && bw_plan.query_param_strip {
                             let src = outgoing.as_deref().unwrap_or(request_head);
                             if let Some(stripped) = strip_tracking_query_params(src) {
                                 info!(
@@ -820,7 +820,7 @@ where
                         }
 
                         // Cache request header stripping for tracker domains
-                        if plan.tracker_match {
+                        if plan.mode == policy::PolicyMode::Enforce && plan.tracker_match {
                             let src = outgoing.as_deref().unwrap_or(request_head);
                             if let Some(stripped) = strip_cache_request_headers(src) {
                                 info!(

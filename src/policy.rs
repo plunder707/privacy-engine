@@ -1314,12 +1314,12 @@ impl PolicyEngine {
         // are exactly these flags: Referer spoofing and query-parameter
         // stripping are applied inside the HTTP/1.1 relay, so a host that needs
         // them needs `should_rewrite` to be true or the relay is never entered.
-        let referer_spoof = mode != PolicyMode::Disabled
+        let referer_spoof = mode == PolicyMode::Enforce
             && cfg_guard.body_rewrite.enabled
             && !cfg_guard.body_rewrite.referer_spoof_domains.is_empty()
             && domain_in_set_or_parent(&normalized, &cfg_guard.body_rewrite.referer_spoof_domains);
 
-        let query_param_strip = mode != PolicyMode::Disabled
+        let query_param_strip = mode == PolicyMode::Enforce
             && cfg_guard.body_rewrite.enabled
             && cfg_guard.body_rewrite.query_param_strip_enabled;
 
@@ -2229,11 +2229,11 @@ mod tests {
             "www.reddit.com has domain-scoped rules and must keep rewriting"
         );
 
-        // A Referer-spoof host keeps rewriting: the spoof is applied inside the
-        // HTTP/1.1 relay, so losing `should_rewrite` would silently drop it.
+        // ReportOnly must not mutate request headers: the shipped policy is
+        // report_only, so a Referer-spoof host is observed but not rewritten.
         let nyt = engine.plan_for_body_rewrite_with_productivity("www.nytimes.com", false);
-        assert!(nyt.referer_spoof);
-        assert!(nyt.should_rewrite);
+        assert!(!nyt.referer_spoof);
+        assert_eq!(nyt.mode, PolicyMode::ReportOnly);
     }
 
     #[test]
@@ -2791,6 +2791,59 @@ mod tests {
         let engine = PolicyEngine::load_from_file(&path, None).unwrap();
         let plan = engine.plan_for_body_rewrite("nytimes.com");
         assert!(!plan.referer_spoof);
+    }
+
+    #[test]
+    fn report_only_plans_do_not_mutate_request_headers_or_queries() {
+        let path = temp_file("report_only_no_mutation");
+        write(
+            &path,
+            r#"{
+              "version": 1, "mode": "report_only",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["example.com"],
+                  "referer_spoof_domains": ["nytimes.com"],
+                  "query_param_strip_enabled": true
+                }
+              }
+            }"#,
+        );
+        let engine = PolicyEngine::load_from_file(&path, None).unwrap();
+        let body = engine.plan_for_body_rewrite("www.nytimes.com");
+        assert_eq!(body.mode, PolicyMode::ReportOnly);
+        assert!(!body.referer_spoof);
+        assert!(!body.query_param_strip);
+        let host = engine.plan_for_host("doubleclick.net");
+        assert_eq!(host.mode, PolicyMode::ReportOnly);
+        assert!(host.tracker_match);
+    }
+
+    #[test]
+    fn enforce_plans_keep_request_header_and_query_mutations() {
+        let path = temp_file("enforce_mutations");
+        write(
+            &path,
+            r#"{
+              "version": 1, "mode": "enforce",
+              "rules": {
+                "tracker_set_cookie": {"enabled": true, "domains": ["doubleclick.net"]},
+                "body_rewrite": {
+                  "enabled": true,
+                  "tracker_script_patterns": ["example.com"],
+                  "referer_spoof_domains": ["nytimes.com"],
+                  "query_param_strip_enabled": true
+                }
+              }
+            }"#,
+        );
+        let engine = PolicyEngine::load_from_file(&path, None).unwrap();
+        let body = engine.plan_for_body_rewrite("www.nytimes.com");
+        assert_eq!(body.mode, PolicyMode::Enforce);
+        assert!(body.referer_spoof);
+        assert!(body.query_param_strip);
     }
 
     #[test]

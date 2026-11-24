@@ -29,7 +29,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 const MAX_DNS_PACKET: usize = 4096;
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const DOH_CLIENT_STALE_SECS: u64 = 24 * 60 * 60;
 const DOH_SNAPSHOT_TOP_CLIENTS: usize = 20;
 
@@ -300,7 +300,16 @@ async fn query_upstream(
 ) -> io::Result<Vec<u8>> {
     if let Some(url) = upstream_doh {
         metrics.inc_dns_doh_query_total();
-        let result = tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(url, query_data)).await;
+        let mut result = tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(url, query_data)).await;
+        if !matches!(result, Ok(Ok(_))) {
+            // The DoH endpoint shows intermittent latency bursts (measured
+            // 16% two-second timeouts on 2026-11-24 while a direct probe was
+            // 73 ms). One short jittered retry recovers most of those without
+            // enabling plaintext UDP fallback or weakening fail-closed.
+            info!(event = "dns_doh_retry", url, "retrying DoH after timeout/error");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            result = tokio::time::timeout(UPSTREAM_TIMEOUT, doh_query(url, query_data)).await;
+        }
         match result {
             Ok(Ok(reply)) => {
                 metrics.inc_dns_response_completed_total();

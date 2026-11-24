@@ -112,7 +112,19 @@
     "qwencloudapi.com",
     "generativelanguage.googleapis.com",
     "aistudio.google.com",
-    "gemini.google.com"
+    "gemini.google.com",
+    "googleapis.com",
+    "googleusercontent.com",
+    "discord.gg",
+    "discord.media",
+    "real-debrid.com",
+    "steampowered.com",
+    "steamstatic.com",
+    "steamgames.com",
+    "steamserver.net",
+    "steamloopback.host",
+    "api.githubcopilot.com",
+    "exp.individual.githubcopilot.com"
   ],
   "enable_mitm": true,
   "mitm_ca_cert_file": "certs/ca_cert.pem",
@@ -142,5 +154,12 @@
   "dashboard_port": 9090,
   "cert_log_file": "state/pe_cert_log.jsonl",
   "cert_pin_file": "state/pe_cert_pins.json",
-  "force_http1_for_filter_rewrite": true
+  "force_http1_for_filter_rewrite": true,
+  "never_intercept_cidrs": [
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "169.254.0.0/16"
+  ]
 }
